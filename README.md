@@ -1,90 +1,85 @@
-# HERE Hackathon
+# HERE-Geospatial-Hackathon 🌍📍
 
-## Prerequisites
+Welcome to the repository for the **Feature Extraction Using GIS Data** hackathon project. This project leverages **LiDAR point clouds**, **Satellite Imagery**, and **Deep Learning** to extract semantic features (buildings, roads, vegetation) from raw geospatial data.
 
-- **Windows 10 / 11**
-- Administrator access (required only for installation)
-- Internet connection
+## 🛠️ Environment Setup (Crucial!)
 
-## 🚀 Step 1: Install Miniconda (Automated)
+**Do not try to install everything at once.** Geospatial libraries (`GDAL`, `PDAL`) and Deep Learning libraries (`PyTorch`) often conflict. Follow this **Strict Hybrid Installation Guide** to set up the environment without errors.
 
-Open **PowerShell as Administrator** and run the following commands.
-This will:
+### **Prerequisites**
 
-- Download Miniconda
-- Install it silently for the current user
-- Remove the installer afterward
+* **Miniconda** (Recommended) or Anaconda installed.
+* **Windows OS** (Commands below are optimized for Windows).
 
-```powershell
-curl https://repo.anaconda.com/miniconda/Miniconda3-latest-Windows-x86_64.exe -o .\miniconda.exe
-start /wait "" .\miniconda.exe /S
-del .\miniconda.exe
+### **Step-by-Step Installation**
+
+**1. Open your Terminal (Anaconda Prompt) and clean your cache:**
+
+```bash
+conda clean --all -y
+
 ```
 
-> ⚠️ **Important**  
-> After installation completes, close PowerShell and open **Anaconda Prompt**.
-> The `conda` command will not be available in a normal PowerShell session yet.
+**2. Create the Skeleton Environment:**
+We use Python 3.10 as it is the most stable for current GIS tools.
 
-## 🚀 Step 2: Configure Global Conda Channels
+```bash
+conda create -n here-env python=3.10 -y
 
-To ensure everyone installs packages from the same trusted source, configure
-`conda-forge` as the primary channel.
-
-Run the following inside **Anaconda Prompt**:
-
-```powershell
-conda config --add channels conda-forge
-conda config --set channel_priority strict
 ```
 
-This guarantees:
+**3. Activate the Environment:**
+*You must do this before proceeding!*
 
-- Consistent builds
-- Fewer dependency conflicts
-- Faster resolution with `mamba`
+```bash
+conda activate here-env
 
-## 🚀 Step 3: Create the `geo` Environment
-
-### 1️. Create and activate the environment
-
-```powershell
-conda create -n geo python=3.7.9 -y
-conda activate geo
 ```
 
-### 2️. Pin the Python version (important)
+**4. Install Heavy Binaries via Conda (The "Hard" Part):**
+We install only the complex C++ dependencies here to avoid solver hangs.
 
-This prevents Python from being upgraded accidentally during installs.
+```bash
+conda install -c conda-forge gdal pdal rasterio fiona -y
 
-```powershell
-echo python ==3.7.9 >> "$env:CONDA_PREFIX\conda-meta\pinned"
 ```
 
-### 3️. Install **Mamba** (faster dependency solver)
+**5. Install Python Libraries via Pip (The "Fast" Part):**
+Once the binaries are set, we use pip for the rest. This is faster and prevents conflicts.
 
-```powershell
-conda install -c conda-forge mamba -y
+```bash
+# Core GIS & 3D tools
+pip install geopandas laspy[lazrs] open3d shapely scikit-learn matplotlib jupyterlab
+
+# Deep Learning (PyTorch) - This may take a few minutes to download
+pip install torch torchvision
+
 ```
 
-### 4. Install the Geospatial Stack
+---
 
-```powershell
-mamba install geopandas laspy laszip pdal python-pdal shapely rasterio pyproj notebook ipykernel -y
+## ✅ Verification
+
+To ensure your environment is ready, run this quick test in your terminal:
+
+```bash
+python -c "import gdal; import pdal; import laspy; import torch; print('✅ SUCCESS: All systems go for here-env!')"
+
 ```
 
-### 5. Install Python bindings for compression & point cloud tools
+If you see `✅ SUCCESS`, you are ready to code.
 
-```powershell
-pip install laszip pptk
-```
+---
 
-## Environment Summary
+## 🆘 Troubleshooting
 
-After setup, the environment includes:
+**"Conda is stuck solving the environment..."**
 
-- **Python 3.7.9 (pinned)**
-- **GeoPandas**
-- **PDAL + python-pdal**
-- **LAS / LAZ support**
-- **Raster & projection tools**
-- **Fast dependency resolution via Mamba**
+* **STOP immediately.** You are likely trying to install `gdal` and `pip` packages in one command.
+* Cancel the process (`Ctrl+C`).
+* Run `conda clean --all` and restart from Step 2 above.
+
+**"DLL Load Failed" on Windows?**
+
+* This usually means a conflict between Conda and Pip versions of `shapely` or `fiona`.
+* Fix: `pip uninstall shapely fiona` -> `conda install -c conda-forge shapely fiona`.
