@@ -211,3 +211,30 @@ __marimo__/
 test-laz-files
 data
 .agent/*
+### JupyterNotebooks template
+# gitignore template for Jupyter Notebooks
+# website: http://jupyter.org/
+
+*/.ipynb_checkpoints/*
+
+# IPython
+
+# Remove previous ipynb_checkpoints
+#   git rm -r .ipynb_checkpoints/
+
+### Python template
+# Byte-compiled / optimized / DLL files
+*.py[cod]
+
+
+# Unit test / coverage reports
+*.py,cover
+
+
+# PyCharm
+#  JetBrains specific template is maintained in a separate JetBrains.gitignore that can
+#  be found at https://github.com/github/gitignore/blob/main/Global/JetBrains.gitignore
+#  and can be added to the global gitignore or merged into this file.  For a more nuclear
+#  option (not recommended) you can uncomment the following to ignore the entire idea folder.
+.idea/
+
