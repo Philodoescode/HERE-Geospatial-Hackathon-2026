@@ -2,14 +2,15 @@ from __future__ import annotations
 
 import ast
 import json
+import re
 from pathlib import Path
-from typing import Iterable, List, Optional, Sequence
+from typing import Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
 from pyproj import CRS
 from shapely import wkt
-from shapely.geometry import LineString, MultiLineString
+from shapely.geometry import LineString, MultiLineString, box
 from shapely.ops import linemerge
 
 
@@ -47,7 +48,35 @@ def _to_linestring(geom_obj) -> Optional[LineString]:
             if not lines:
                 return None
             return max(lines, key=lambda g: g.length)
+    if hasattr(geom_obj, "geoms"):
+        lines = []
+        for g in geom_obj.geoms:
+            if isinstance(g, LineString):
+                lines.append(g)
+            elif isinstance(g, MultiLineString):
+                lines.extend(list(g.geoms))
+        if lines:
+            merged = linemerge(lines)
+            if isinstance(merged, LineString):
+                return merged
+            if isinstance(merged, MultiLineString):
+                return max(list(merged.geoms), key=lambda gg: gg.length)
     return None
+
+
+def _to_linestring_list(geom_obj) -> List[LineString]:
+    if geom_obj is None or geom_obj.is_empty:
+        return []
+    if isinstance(geom_obj, LineString):
+        return [geom_obj]
+    if isinstance(geom_obj, MultiLineString):
+        return [g for g in geom_obj.geoms if isinstance(g, LineString) and not g.is_empty]
+    if hasattr(geom_obj, "geoms"):
+        lines: List[LineString] = []
+        for g in geom_obj.geoms:
+            lines.extend(_to_linestring_list(g))
+        return lines
+    return []
 
 
 def _safe_parse_wkt_linestring(text: object) -> Optional[LineString]:
@@ -58,6 +87,16 @@ def _safe_parse_wkt_linestring(text: object) -> Optional[LineString]:
     except Exception:
         return None
     return _to_linestring(geom_obj)
+
+
+def _safe_parse_wkt_linestrings(text: object) -> List[LineString]:
+    if text is None or (isinstance(text, float) and np.isnan(text)):
+        return []
+    try:
+        geom_obj = wkt.loads(str(text))
+    except Exception:
+        return []
+    return _to_linestring_list(geom_obj)
 
 
 def infer_local_projected_crs(geometries: Sequence[LineString]) -> CRS:
@@ -94,8 +133,8 @@ def load_vpd_traces(csv_path: str | Path, fused_only: bool = True, max_rows: int
     if fused_only and "fused" in df.columns:
         df = df[df["fused"].astype(str).str.lower().isin({"yes", "true", "1"})].copy()
 
-    df["geometry"] = df["path"].map(_safe_parse_wkt_linestring)
-    df = df[df["geometry"].notnull()].copy()
+    df["geometry_parts"] = df["path"].map(_safe_parse_wkt_linestrings)
+    df = df[df["geometry_parts"].map(len) > 0].copy()
 
     df["altitudes"] = df["altitudes"].map(_parse_list)
     df["crosswalk_types"] = df["crosswalktypes"].map(_parse_list)
@@ -114,6 +153,31 @@ def load_vpd_traces(csv_path: str | Path, fused_only: bool = True, max_rows: int
     df["path_quality_score"] = pd.to_numeric(df["pathqualityscore"], errors="coerce")
     df["sensor_quality_score"] = pd.to_numeric(df["sensorqualityscore"], errors="coerce")
 
+    rows = []
+    for row in df.itertuples(index=False):
+        parts = list(getattr(row, "geometry_parts", []))
+        if not parts:
+            continue
+        for idx, geom in enumerate(parts):
+            if geom is None or geom.is_empty or geom.length <= 0:
+                continue
+            rows.append(
+                {
+                    "trace_id": f"{row.trace_id}_p{idx}" if len(parts) > 1 else row.trace_id,
+                    "source": row.source,
+                    "geometry": geom,
+                    "day": row.day,
+                    "hour": row.hour,
+                    "construction_percent": row.construction_percent,
+                    "altitudes": row.altitudes,
+                    "crosswalk_types": row.crosswalk_types,
+                    "traffic_signal_count": row.traffic_signal_count,
+                    "path_quality_score": row.path_quality_score,
+                    "sensor_quality_score": row.sensor_quality_score,
+                    # Optional per-point timestamps (not available for VPD in this release).
+                    "point_times": [],
+                }
+            )
     columns = [
         "trace_id",
         "source",
@@ -126,8 +190,9 @@ def load_vpd_traces(csv_path: str | Path, fused_only: bool = True, max_rows: int
         "traffic_signal_count",
         "path_quality_score",
         "sensor_quality_score",
+        "point_times",
     ]
-    return df[columns].reset_index(drop=True)
+    return pd.DataFrame(rows, columns=columns).reset_index(drop=True)
 
 
 def load_hpd_traces(csv_paths: Iterable[str | Path], max_rows_per_file: int | None = None) -> pd.DataFrame:
@@ -161,6 +226,7 @@ def load_hpd_traces(csv_paths: Iterable[str | Path], max_rows_per_file: int | No
                 "traffic_signal_count",
                 "path_quality_score",
                 "sensor_quality_score",
+                "point_times",
             ]
         )
 
@@ -196,6 +262,10 @@ def load_hpd_traces(csv_paths: Iterable[str | Path], max_rows_per_file: int | No
                 "traffic_signal_count": 0.0,
                 "path_quality_score": np.nan,
                 "sensor_quality_score": np.nan,
+                "point_times": [
+                    int(t.hour) * 3600 + int(t.minute) * 60 + int(t.second)
+                    for t in grp["time"]
+                ],
                 "hpd_median_speed": float(np.nanmedian(grp["speed"])) if grp["speed"].notnull().any() else np.nan,
                 "hpd_median_heading": float(np.nanmedian(grp["heading"])) if grp["heading"].notnull().any() else np.nan,
             }
@@ -211,6 +281,53 @@ def load_navstreet_csv(csv_path: str | Path) -> pd.DataFrame:
     df = pd.read_csv(csv_path)
     if "geom" not in df.columns:
         raise ValueError("Expected 'geom' column in navstreet CSV.")
-    df["geometry"] = df["geom"].map(_safe_parse_wkt_linestring)
-    df = df[df["geometry"].notnull()].copy()
-    return df
+    df["geometry_parts"] = df["geom"].map(_safe_parse_wkt_linestrings)
+    df = df[df["geometry_parts"].map(len) > 0].copy()
+
+    rows = []
+    for row in df.itertuples(index=False):
+        parts = list(getattr(row, "geometry_parts", []))
+        for idx, geom in enumerate(parts):
+            payload = row._asdict()
+            payload.pop("geometry_parts", None)
+            payload["geometry"] = geom
+            payload["geom_part_idx"] = int(idx)
+            rows.append(payload)
+
+    return pd.DataFrame(rows)
+
+
+def load_bbox_from_txt(bbox_path: str | Path) -> Tuple[float, float, float, float]:
+    """
+    Parse a bbox text file such as:
+    Kosovo:
+    [21.088588, 42.571255, 21.188588, 42.671255]
+    """
+    text = Path(bbox_path).read_text(encoding="utf-8")
+    nums = [float(x) for x in re.findall(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?", text)]
+    if len(nums) < 4:
+        raise ValueError(f"Could not parse bbox from {bbox_path}")
+    min_lon, min_lat, max_lon, max_lat = nums[-4], nums[-3], nums[-2], nums[-1]
+    if not (min_lon < max_lon and min_lat < max_lat):
+        raise ValueError(f"Invalid bbox in {bbox_path}: {(min_lon, min_lat, max_lon, max_lat)}")
+    return (min_lon, min_lat, max_lon, max_lat)
+
+
+def clip_line_geometries_to_bbox(
+        df: pd.DataFrame,
+        bbox_wgs84: Tuple[float, float, float, float],
+        geometry_col: str = "geometry",
+) -> pd.DataFrame:
+    """
+    Clip line geometries to a WGS84 bbox and keep non-empty line parts.
+    """
+    if df.empty or geometry_col not in df.columns:
+        return df.copy()
+    clip_poly = box(*bbox_wgs84)
+    out = df.copy()
+    out[geometry_col] = out[geometry_col].map(
+        lambda g: _to_linestring(g.intersection(clip_poly)) if g is not None else None
+    )
+    out = out[out[geometry_col].notnull()].copy()
+    out = out[~out[geometry_col].map(lambda g: g.is_empty)].copy()
+    return out.reset_index(drop=True)

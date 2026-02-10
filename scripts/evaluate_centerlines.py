@@ -8,7 +8,11 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from centerline.evaluation import evaluate_centerlines, save_metrics
+from centerline.evaluation import (
+    evaluate_centerlines,
+    generate_evaluation_plots,
+    save_metrics,
+)
 
 
 def find_default_ground_truth() -> Path:
@@ -43,7 +47,54 @@ def main() -> None:
     parser.add_argument("--ground-truth-layer", default="navstreet")
     parser.add_argument("--buffer-m", type=float, default=15.0)
     parser.add_argument("--sample-step-m", type=float, default=10.0)
+    parser.add_argument(
+        "--compute-topology-metrics",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Compute node-degree similarity and intersection-location error metrics.",
+    )
+    parser.add_argument(
+        "--compute-hausdorff",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Compute optional Hausdorff shape-similarity summary.",
+    )
+    parser.add_argument(
+        "--bbox-file",
+        type=Path,
+        default=Path("data/Kosovo_bounding_box.txt"),
+        help="Path to WGS84 bbox text file.",
+    )
+    parser.add_argument(
+        "--apply-bbox",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Clip generated and GT geometries to bbox before scoring.",
+    )
+    parser.add_argument(
+        "--clip-generated-to-ground-truth",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Additionally clip generated geometries to ground-truth extent for aligned scoring.",
+    )
+    parser.add_argument(
+        "--clip-buffer-m",
+        type=float,
+        default=0.0,
+        help="Buffer applied to GT extent when --clip-generated-to-ground-truth is enabled.",
+    )
     parser.add_argument("--out", type=Path, default=Path("outputs/evaluation/centerline_metrics.json"))
+    parser.add_argument(
+        "--plots-out-dir",
+        type=Path,
+        default=None,
+        help="Optional directory for evaluation plots (overlay + mismatch).",
+    )
+    parser.add_argument(
+        "--plot-stem",
+        default="centerline_eval",
+        help="Filename stem for plot outputs.",
+    )
     args = parser.parse_args()
 
     gt = args.ground_truth or find_default_ground_truth()
@@ -55,10 +106,31 @@ def main() -> None:
         ground_truth_layer=args.ground_truth_layer,
         buffer_m=args.buffer_m,
         sample_step_m=args.sample_step_m,
+        bbox_file=args.bbox_file,
+        apply_bbox=args.apply_bbox,
+        clip_generated_to_ground_truth=args.clip_generated_to_ground_truth,
+        clip_buffer_m=args.clip_buffer_m,
+        compute_topology_metrics=args.compute_topology_metrics,
+        compute_hausdorff=args.compute_hausdorff,
     )
     save_metrics(metrics, args.out)
 
+    plot_files = None
+    if args.plots_out_dir is not None:
+        plot_files = generate_evaluation_plots(
+            generated_centerlines=args.generated,
+            ground_truth_navstreet=gt,
+            out_dir=args.plots_out_dir,
+            generated_layer=args.generated_layer,
+            ground_truth_layer=args.ground_truth_layer,
+            buffer_m=args.buffer_m,
+            stem=args.plot_stem,
+        )
+
     print(f"Saved evaluation metrics: {args.out}")
+    if plot_files is not None:
+        for k, v in plot_files.items():
+            print(f"{k}: {v}")
     for k, v in metrics.items():
         print(f"{k}: {v}")
 

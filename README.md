@@ -114,26 +114,64 @@ After setup, the environment includes:
 
 ## Centerline Generation (Problem 1)
 
-The repository now includes a Kharita-inspired centerline pipeline adapted for HERE VPD/HPD data:
+The repository includes two pluggable map-construction algorithms:
 
-- `scripts/prepare_navstreet_ground_truth.py`
-- `scripts/generate_centerlines.py`
-- `scripts/evaluate_centerlines.py`
+- `kharita` (baseline)
+- `roadster` (Roadster-adapted subtrajectory clustering pipeline)
 
-### 1. Prepare Kosovo navstreet ground truth
+### Core scripts
 
-```powershell
-python scripts/prepare_navstreet_ground_truth.py
-```
+- `scripts/preprocess_traces.py` (Probe/VPD preprocessing)
+- `scripts/prepare_navstreet_ground_truth.py` (Kosovo navstreet preprocessing)
+- `scripts/generate_centerlines.py` (map construction)
+- `scripts/evaluate_centerlines.py` (metrics + optional plots)
 
-### 2. Generate centerlines from VPD + HPD
-
-```powershell
-python scripts/generate_centerlines.py
-```
-
-### 3. Evaluate generated centerlines
+### 1. Preprocess Probe/VPD traces
 
 ```powershell
-python scripts/evaluate_centerlines.py
+python scripts/preprocess_traces.py `
+  --vpd-csv data/Kosovo_VPD/Kosovo_VPD.csv `
+  --hpd-csvs data/Kosovo_HPD/XKO_HPD_week_1.csv data/Kosovo_HPD/XKO_HPD_week_2.csv `
+  --out-dir outputs/preprocessed `
+  --stem kosovo_preprocessed
 ```
+
+### 2. Prepare Kosovo navstreet ground truth
+
+```powershell
+python scripts/prepare_navstreet_ground_truth.py `
+  --nav-csv "data/Kosovo's nav streets/Kosovo.csv" `
+  --out-dir outputs/ground_truth `
+  --stem kosovo_navstreet_ground_truth
+```
+
+### 3. Generate centerlines (Roadster)
+
+```powershell
+python scripts/generate_centerlines.py `
+  --algorithm roadster `
+  --vpd-csv data/Kosovo_VPD/Kosovo_VPD.csv `
+  --hpd-csvs data/Kosovo_HPD/XKO_HPD_week_1.csv data/Kosovo_HPD/XKO_HPD_week_2.csv `
+  --out-dir outputs/centerlines_roadster `
+  --stem kosovo_centerlines_roadster
+```
+
+### 4. Evaluate against navstreets (+ plots)
+
+```powershell
+python scripts/evaluate_centerlines.py `
+  --generated outputs/centerlines_roadster/kosovo_centerlines_roadster.gpkg `
+  --generated-layer centerlines `
+  --ground-truth outputs/ground_truth/kosovo_navstreet_ground_truth.gpkg `
+  --ground-truth-layer navstreet `
+  --out outputs/evaluation/roadster_metrics.json `
+  --compute-topology-metrics `
+  --compute-hausdorff `
+  --plots-out-dir outputs/evaluation/plots `
+  --plot-stem roadster_eval
+```
+
+### Notes
+
+- Roadster adaptation details: `context/roadster_adaptation_notes.md`
+- Preprocessing uses source-specific settings (tighter for VPD, more conservative for Probe/HPD).

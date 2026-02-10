@@ -8,19 +8,53 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from centerline.algorithms import get_algorithm, list_algorithms
 from centerline.generation import (
-    CenterlineConfig,
-    generate_centerlines,
+    generate_centerlines_with_algorithm,
     save_centerline_outputs,
 )
 
 
 def main() -> None:
+    # ------------------------------------------------------------------
+    # Phase 1: parse only --algorithm so we can ask the selected
+    # algorithm to register its own CLI flags before the full parse.
+    # ------------------------------------------------------------------
+    pre_parser = argparse.ArgumentParser(add_help=False)
+    pre_parser.add_argument(
+        "--algorithm",
+        type=str,
+        default="roadster",
+        help=(
+            "Centerline generation algorithm to use.  "
+            f"Available: {', '.join(name for name, _ in list_algorithms())}"
+        ),
+    )
+    pre_parser.add_argument(
+        "--list-algorithms",
+        action="store_true",
+        default=False,
+        help="List available algorithms and exit.",
+    )
+    pre_args, _remaining = pre_parser.parse_known_args()
+
+    if pre_args.list_algorithms:
+        print("Available centerline generation algorithms:")
+        for name, desc in list_algorithms():
+            print(f"  {name:20s}  {desc}")
+        sys.exit(0)
+
+    algorithm = get_algorithm(pre_args.algorithm)
+
+    # ------------------------------------------------------------------
+    # Phase 2: build the full parser with algorithm-specific arguments.
+    # ------------------------------------------------------------------
     parser = argparse.ArgumentParser(
+        parents=[pre_parser],
         description=(
-            "Generate road centerlines from VPD (WKT LINESTRING) and HPD probe data "
-            "using a Kharita-inspired clustering + co-occurrence graph pipeline."
-        )
+            "Generate road centerlines from VPD and HPD probe data "
+            "using a pluggable algorithm system."
+        ),
     )
     parser.add_argument(
         "--vpd-csv", type=Path, default=Path("data/Kosovo_VPD/Kosovo_VPD.csv")
@@ -39,37 +73,44 @@ def main() -> None:
     parser.add_argument(
         "--fused-only", action=argparse.BooleanOptionalAction, default=True
     )
-
-    # Tuning knobs
-    parser.add_argument("--cluster-radius-m", type=float, default=10.0)
-    parser.add_argument("--heading-tolerance-deg", type=float, default=45.0)
-    parser.add_argument("--sample-spacing-m", type=float, default=8.0)
-    parser.add_argument("--max-points-per-trace", type=int, default=120)
-    parser.add_argument("--min-edge-support", type=float, default=2.0)
-    parser.add_argument("--smooth-iterations", type=int, default=2)
+    parser.add_argument(
+        "--bbox-file",
+        type=Path,
+        default=Path("data/Kosovo_bounding_box.txt"),
+        help="Path to WGS84 bbox text file.",
+    )
+    parser.add_argument(
+        "--apply-bbox",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Clip input traces to bbox before centerline generation.",
+    )
 
     # Optional subsampling for rapid experiments
     parser.add_argument("--max-vpd-rows", type=int, default=None)
     parser.add_argument("--max-hpd-rows-per-file", type=int, default=None)
 
+    # Let the selected algorithm add its own CLI args
+    algorithm.add_cli_args(parser)
+
     args = parser.parse_args()
 
-    config = CenterlineConfig(
-        cluster_radius_m=args.cluster_radius_m,
-        heading_tolerance_deg=args.heading_tolerance_deg,
-        sample_spacing_m=args.sample_spacing_m,
-        max_points_per_trace=args.max_points_per_trace,
-        min_edge_support=args.min_edge_support,
-        smooth_iterations=args.smooth_iterations,
-    )
+    # Let the algorithm read back its parsed CLI args
+    algorithm.configure(args)
 
-    result = generate_centerlines(
+    # ------------------------------------------------------------------
+    # Run the pipeline
+    # ------------------------------------------------------------------
+    print(f"Algorithm: {algorithm.name}")
+    result = generate_centerlines_with_algorithm(
         vpd_csv=args.vpd_csv,
         hpd_csvs=args.hpd_csvs,
-        config=config,
+        algorithm=algorithm,
         fused_only=args.fused_only,
         max_vpd_rows=args.max_vpd_rows,
         max_hpd_rows_per_file=args.max_hpd_rows_per_file,
+        bbox_file=args.bbox_file,
+        apply_bbox=args.apply_bbox,
     )
     files = save_centerline_outputs(
         result=result, output_dir=args.out_dir, stem=args.stem
