@@ -109,3 +109,31 @@ After setup, the environment includes:
 - Ensure you have a stable internet connection
 - Try running `conda clean --all -y` first
 - Make sure conda-forge channel is configured (Step 2)
+
+---
+
+## Centerline Generation (Problem 1)
+
+The repository now includes a Kharita-inspired centerline pipeline adapted for HERE VPD/HPD data:
+
+- `scripts/prepare_navstreet_ground_truth.py`
+- `scripts/generate_centerlines.py`
+- `scripts/evaluate_centerlines.py`
+
+### 1. Prepare Kosovo navstreet ground truth
+
+```powershell
+python scripts/prepare_navstreet_ground_truth.py
+```
+
+### 2. Generate centerlines from VPD + HPD
+
+```powershell
+python scripts/generate_centerlines.py
+```
+
+### 3. Evaluate generated centerlines
+
+```powershell
+python scripts/evaluate_centerlines.py
+```

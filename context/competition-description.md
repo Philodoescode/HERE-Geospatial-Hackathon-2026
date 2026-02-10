@@ -1,84 +1,127 @@
-### Core Theme: Feature Extraction Using GIS Data
+# HERE Cairo Hackathon 2026
+**Features Extraction Using GIS Data!**
+Hosted by Geospatial Community of Practice
 
-This February, HERE Technologies–the world’s leading location platform–will host a student hackathon in Cairo and
-universities from across the country are invited to take part.
-Join us to explore the power of machine learning and deep learning in feature extraction.
-This hackathon will challenge participants to build innovative models and perform sample analyses using GIS data,
-unlocking new possibilities in spatial intelligence.
+---
 
-### Eligibility & Prizes
+## Problem Statement
+**Online Session**
+**Ricardo Caiado Metrogos**
+Lead GIS Data Engineer
 
-This event serves as a significant recruitment and talent-scouting pipeline for HERE Technologies in the MENA region.
+---
 
-### **Who Can Join:**
+## The Challenge – Geometry hackathon Cairo
+**Centerline creation from wide available sources (VPD, PROBE)**
 
-- Students currently enrolled in **Bachelor’s or Master’s** degree programs.
-- Fields of study typically include Geoinformatics, Computer Science, Data Science, or Big Data.
-- Participants must maintain active student status at least until **September 2026**.
+### Sources – VPD and Probe
+#### VPD (Vehicle Path Data)
+*   VPD provides localized road-level observations that are typically more precise than probe GPS data but limited to where sensor-equipped vehicles have driven.
+*   Unlike probe data, VPD is **vehicle-only** and more structured.
+*   Delivered as **WKT LINESTRING**.
+*   Coordinates in **WGS84 (EPSG:4326)**.
+*   We use only **Fused True** drives (If True, path contains fused path. Else, it contains raw GPS path).
 
-### **The Rewards:**
+#### Attributes
+*   Date, Hour
+*   Construction Percent
+*   Altitudes
+*   Crosswalk types
+*   Traffic signal count
+*   Direction of travel (implicit on drive direction)
 
-- **1st Place:** A **paid internship (up to 10 weeks)** at HERE Technologies, working directly with geospatial experts.
-- **2nd & 3rd Place:** **Amazon vouchers** (valid for one year) and technical recognition.
+#### Geometry Format
+*   Delivered as **WKT LINESTRING**
+*   Coordinates in **WGS84**
 
-> **Note:** HERE Technologies often hosts these hackathons in collaboration with the "HERE Geospatial Community of
-> Practice," meaning the judging criteria will likely focus heavily on **model precision**, **code efficiency**, and the *
-*scalability** of the geospatial solution.
->
+| path | altitudes |
+| :--- | :--- |
+| LINESTRING (150.78007542377264 -33.73787582125322, 150.7800561600... | [ 59.38303213752806,... |
+| LINESTRING (55.331326034295174 25.227238038699667, 55.33135079199... | [ -31.184026181697845... |
+| LINESTRING (-89.59045854004647 34.3578389607912, -89.59045827488... | [ 87.3300636895001, ... |
 
-### **Essential Python Libraries**
+---
 
-It is recommended to install the following libraries ahead of time, ideally within a virtual environment:
+### VPD Visuals
+*   **Fused True and False:** Shows raw, noisy path data.
+*   **Fused True only:** Shows cleaner, more aligned road path observations.
+*   **Examples:** Potential parking lot, well-defined roads with adjacent single drives, roads at different levels.
 
-- **GeoPandas** – Enables manipulation and analysis of geospatial vector data using pandas‑like operations.
-- **Laspy** – Reads and writes LAS/LAZ LiDAR point cloud files.
-- **LASzip** – Compresses and decompresses LAS files into efficient LAZ format.
-- **PDAL** – A powerful library and pipeline framework for processing, filtering, and transforming point cloud data.
-- **Shapely** – Performs geometric operations (e.g., intersections, buffers, unions) on vector shapes.
-- **Rasterio** – Reads, writes, and processes raster datasets (e.g., GeoTIFF).
-- **PyProj** – Handles map projections and coordinate transformations.
+---
 
-### **Optional Python Libraries**
+### Probe
+*   Probe data represents location traces collected from moving entities, such as vehicles, mobile devices, or other connected sensors. Probes are not limited to cars and may include mixed travel modes.
+*   Probe data is typically:
+    *   Noisy (GPS drift, variable accuracy)
+    *   Sparse or unevenly sampled
+    *   Collected at different speeds and sampling rates
+*   Each probe trace approximates a path taken through the road network but does not directly represent a road centerline.
+*   Probe is nevertheless widely available.
 
-- **Open3D** – Provides tools for working with 3D data, including visualization and point‑cloud processing.
-- **Pptk (Find the attached file)**– A lightweight point‑cloud visualization toolkit for quick inspection of LiDAR data.
+#### Attributes
+*   Timestamp
+*   Latitude / Longitude
+*   Speed (optional)
+*   Heading / bearing (optional)
+*   Probe source or type (optional)
 
-### **GeoAI Resources (Optional Recommendations)**
+#### Geometry Format
+*   Delivered as **WKT LINESTRING** (individual traces) or **MULTILINESTRING** (grouped traces)
+*   Coordinates in **WGS84**
 
-**YouTube – GeoAI Made Easy:**
+---
 
-- https://www.youtube.com/watch?v=VIl29Rca6zE&list=PLAxJ4-o7ZoPcvENqwaPa_QwbbkZ5sctZE**
+### Problem 1 – Centerline Generation from Probe & VPD Data
+**Goal:** Design an algorithm or pipeline to convert raw probe traces and/or VPD detections into smooth, continuous, and topologically correct road centerlines suitable for ingestion into a road network.
 
-**GeoAI Documentation:**
+#### Key focus areas:
+*   Handling sparse, noisy, and heterogeneous inputs
+*   Clustering and alignment of output
+*   Generating smooth and connected centerlines
+*   Preserving intersections and road continuity
 
-- [https://opengeoai.org/](https://opengeoai.org/**)
+#### Key Deliverables:
+*   Algorithm or model description
+*   Generated centerline examples
+*   Quality evaluation metrics
 
-### **Software Options**
+---
 
-Any of the following tools may be used based on preference:
+### Problem 2 – Road Geometry Filtering & Classification
+**Goal:** Build a system to classify detected road geometries and decide whether they should be ingested into the road network.
 
-- QGIS
-- ArcGIS
-- A local version of maplibre‑gl‑lidar:
-    - https://github.com/opengeos/maplibre-gl-lidar?tab=readme-ov-file
+#### Key focus areas:
+*   Use of probe and VPD signals (density, directionality, temporal consistency)
+*   Distinguishing navigable roads from low-value or non-navigable\routable paths
+*   Handling ambiguous cases and minimizing false positives
 
-### **Mandatory Software**
+#### Key Deliverables:
+*   Classification approach* or model description (ML-based, rule-based,..)
+*   Definition of input features and class labels
+*   Classification results with performance metrics
+*   Error analysis and examples of misclassified geometries
 
-- **Webex**
+***Example of possible classes:**
+*   Public navigable roads
+*   Restricted or residential roads
+*   Parking entrances, service roads
 
-### **Key Concepts to Review**
+---
 
-- Fundamentals of LiDAR data :
-    - [The Basics of LiDAR - Light Detection and Ranging - Remote Sensing | NSF NEON | Open Data to Understand our Ecosystems](https://www.neonscience.org/resources/learning-hub/tutorials/lidar-basics)
-- Probe data visualization:
-    - https://www.here.com/learn/blog/here-probe-data-visualization-with-python
+## Judging Criteria
 
-### **Venue Regulations:**
+| Criterion | Question |
+| :--- | :--- |
+| **Innovation** | Is the solution unique and creative? |
+| **Technical Implementation** | How effectively does the solution use HERE tech & relevant tech (e.g., databases, AI/ML)? |
+| **Functionality** | Does it work as intended? |
+| **Global Scalability** | Can the solution be implemented across different countries? |
+| **Impact** | Is it feasible to implement? |
+| **Presentation** | Is the solution clearly explained? |
 
-- **Entry:** Please carry a **valid ID** and your confirmation email for entry.
-- **Wi-Fi:** Will be provided. **Bring your own devices and chargers and your Smile**
-- **Code of Conduct:** Respect all participants and maintain a collaborative environment.
-- **Cleanliness:** Keep your workspace clean and dispose of waste properly.
-- **Security:** Do not leave valuables unattended. Organizers are not responsible for lost items.
-- **Emergency:** First aid and emergency contact numbers will be available at the help desk.
-
+## Evaluation Criteria
+* assumptions made at the start 
+* algorithm
+* steps
+* next steps for improvement
+* the metric used and the result
