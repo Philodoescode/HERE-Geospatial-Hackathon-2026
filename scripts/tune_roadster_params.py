@@ -18,7 +18,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from centerline.algorithms.roadster import RoadsterAlgorithm, RoadsterConfig
-from centerline.evaluation import evaluate_centerline_geodataframes
+from centerline.evaluation import build_evaluation_context, evaluate_centerline_geodataframes
 from centerline.generation import generate_centerlines_with_algorithm, save_centerline_outputs
 from centerline.io_utils import load_navstreet_csv
 
@@ -86,12 +86,24 @@ def _emit_trial_progress(
     )
 
 
+def _get_nested_float(payload: dict, path: list[str], default: float = 0.0) -> float:
+    cur = payload
+    for key in path:
+        if not isinstance(cur, dict) or key not in cur:
+            return float(default)
+        cur = cur[key]
+    try:
+        return float(cur)
+    except Exception:
+        return float(default)
+
+
 def tune_roadster_params(
     *,
     vpd_csv: str | Path = Path("data/Kosovo_VPD/Kosovo_VPD.csv"),
     hpd_csvs: list[str | Path] | None = None,
-    ground_truth: str | Path = Path("outputs/ground_truth/kosovo_navstreet_ground_truth.gpkg"),
-    ground_truth_layer: str = "navstreet",
+    ground_truth: str | Path = Path("data/Kosovo's nav streets/nav_kosovo.gpkg"),
+    ground_truth_layer: str = "Kosovo22",
     bbox_file: str | Path = Path("data/Kosovo_bounding_box.txt"),
     apply_bbox: bool = True,
     max_vpd_rows: int | None = 1500,
@@ -135,6 +147,14 @@ def tune_roadster_params(
         "min_centerline_length_m": _parse_float_list(min_centerline_length_values),
     }
     trial_params = _build_trials(space=space, search=search, n_trials=trials, seed=seed)
+    topology_radii_m = (8.0, 15.0)
+    eval_context = build_evaluation_context(
+        gt_gdf,
+        bbox_file=bbox_file,
+        apply_bbox=apply_bbox,
+        sample_step_m=sample_step_m,
+        topology_radii_m=topology_radii_m,
+    )
 
     rows = []
     best = None
@@ -164,7 +184,12 @@ def tune_roadster_params(
             center = result.get("centerlines", pd.DataFrame())
             center_count = int(len(center))
             if center_count == 0:
-                metrics = {"length_f1": 0.0, "length_precision": 0.0, "length_recall": 0.0}
+                metrics = {
+                    "length_f1": 0.0,
+                    "length_precision": 0.0,
+                    "length_recall": 0.0,
+                    "topology": {},
+                }
             else:
                 center_gdf = gpd.GeoDataFrame(center.copy(), geometry="geometry", crs="EPSG:4326")
                 metrics = evaluate_centerline_geodataframes(
@@ -174,10 +199,19 @@ def tune_roadster_params(
                     sample_step_m=sample_step_m,
                     bbox_file=bbox_file,
                     apply_bbox=apply_bbox,
+                    context=eval_context,
+                    compute_topology_metrics=True,
+                    compute_itopo=True,
+                    topology_radii_m=topology_radii_m,
+                    compute_hausdorff=False,
                 )
             f1 = float(metrics.get("length_f1", 0.0) or 0.0)
             precision = float(metrics.get("length_precision", 0.0) or 0.0)
             recall = float(metrics.get("length_recall", 0.0) or 0.0)
+            topo_f1_8 = _get_nested_float(metrics, ["topology", "topo", "by_radius_m", "8.0", "f1"])
+            topo_f1_15 = _get_nested_float(metrics, ["topology", "topo", "by_radius_m", "15.0", "f1"])
+            itopo_f1_8 = _get_nested_float(metrics, ["topology", "i_topo", "by_radius_m", "8.0", "f1"])
+            itopo_f1_15 = _get_nested_float(metrics, ["topology", "i_topo", "by_radius_m", "15.0", "f1"])
             score = f1 - complexity_penalty * center_count
             elapsed = time.time() - t0
 
@@ -190,6 +224,10 @@ def tune_roadster_params(
                 "length_precision": precision,
                 "length_recall": recall,
                 "length_f1": f1,
+                "topo_f1_r8": topo_f1_8,
+                "topo_f1_r15": topo_f1_15,
+                "i_topo_f1_r8": itopo_f1_8,
+                "i_topo_f1_r15": itopo_f1_15,
                 "objective_score": score,
                 "elapsed_sec": elapsed,
                 "status": "ok",
@@ -203,7 +241,13 @@ def tune_roadster_params(
                 trial_idx=idx,
                 total_trials=total_trials,
                 message="Trial complete.",
-                metrics={"score": round(score, 6), "f1": round(f1, 6), "centerlines": center_count},
+                metrics={
+                    "score": round(score, 6),
+                    "f1": round(f1, 6),
+                    "topo8": round(topo_f1_8, 6),
+                    "itopo8": round(itopo_f1_8, 6),
+                    "centerlines": center_count,
+                },
             )
         except Exception as ex:
             elapsed = time.time() - t0
@@ -216,6 +260,10 @@ def tune_roadster_params(
                 "length_precision": 0.0,
                 "length_recall": 0.0,
                 "length_f1": 0.0,
+                "topo_f1_r8": 0.0,
+                "topo_f1_r15": 0.0,
+                "i_topo_f1_r8": 0.0,
+                "i_topo_f1_r15": 0.0,
                 "objective_score": -1e9,
                 "elapsed_sec": elapsed,
                 "status": "failed",
@@ -286,8 +334,8 @@ def main() -> None:
         nargs="+",
         default=[Path("data/Kosovo_HPD/XKO_HPD_week_1.csv"), Path("data/Kosovo_HPD/XKO_HPD_week_2.csv")],
     )
-    parser.add_argument("--ground-truth", type=Path, default=Path("outputs/ground_truth/kosovo_navstreet_ground_truth.gpkg"))
-    parser.add_argument("--ground-truth-layer", default="navstreet")
+    parser.add_argument("--ground-truth", type=Path, default=Path("data/Kosovo's nav streets/nav_kosovo.gpkg"))
+    parser.add_argument("--ground-truth-layer", default="Kosovo22")
     parser.add_argument("--bbox-file", type=Path, default=Path("data/Kosovo_bounding_box.txt"))
     parser.add_argument("--apply-bbox", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--max-vpd-rows", type=int, default=1500)

@@ -1,15 +1,18 @@
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 import json
 from pathlib import Path
-from typing import Dict, Iterable, Tuple
+import time
+from typing import Dict, Iterable, Sequence
 
 import geopandas as gpd
 import numpy as np
 import pandas as pd
+from pyproj import CRS
 from scipy.spatial import cKDTree
 from shapely import wkt
-from shapely.geometry import LineString, Point, box
+from shapely.geometry import LineString, box
 from shapely.ops import unary_union
 
 from .io_utils import (
@@ -18,6 +21,30 @@ from .io_utils import (
     load_bbox_from_txt,
     load_navstreet_csv,
 )
+
+
+@dataclass
+class EvaluationContext:
+    projected_crs: CRS
+    gt_proj: gpd.GeoDataFrame
+    gt_total_length_m: float
+    gt_sindex: object
+    gt_nodes: dict[int, tuple[float, float]]
+    gt_edges: list[tuple[int, int]]
+    gt_intersections: np.ndarray
+    gt_intersection_tree: cKDTree | None
+    apply_bbox: bool
+    bbox_file: str | None
+    snap_m: float
+    default_sample_step_m: float
+    topology_radii_m: tuple[float, ...]
+    gt_sampled_points_cache: dict[float, np.ndarray] = field(default_factory=dict)
+
+    def get_gt_sampled_points(self, step_m: float) -> np.ndarray:
+        key = float(max(step_m, 0.5))
+        if key not in self.gt_sampled_points_cache:
+            self.gt_sampled_points_cache[key] = _sample_points(self.gt_proj.geometry, step_m=key)
+        return self.gt_sampled_points_cache[key]
 
 
 def _table_columns(path: str | Path) -> list[str]:
@@ -61,17 +88,30 @@ def _load_line_geodata(path: str | Path, layer: str | None = None) -> gpd.GeoDat
 
 
 def _sample_points(geoms: Iterable[LineString], step_m: float, max_points: int = 500000) -> np.ndarray:
+    step = float(max(step_m, 0.5))
     pts = []
     for g in geoms:
         if g is None or g.is_empty:
             continue
+        if not isinstance(g, LineString):
+            continue
         length = float(g.length)
         if length <= 0:
             continue
-        n = max(int(length // max(step_m, 0.5)), 1)
-        for d in np.linspace(0.0, length, n + 1):
-            p = g.interpolate(float(d))
-            pts.append((float(p.x), float(p.y)))
+        coords = np.asarray(g.coords, dtype=np.float64)
+        if len(coords) < 2:
+            continue
+        seg = np.diff(coords, axis=0)
+        seg_len = np.hypot(seg[:, 0], seg[:, 1])
+        if np.all(seg_len <= 0):
+            continue
+        cum = np.concatenate(([0.0], np.cumsum(seg_len)))
+        n = max(int(length // step), 1)
+        d = np.linspace(0.0, length, n + 1, dtype=np.float64)
+        xs = np.interp(d, cum, coords[:, 0])
+        ys = np.interp(d, cum, coords[:, 1])
+        for x, y in zip(xs, ys):
+            pts.append((float(x), float(y)))
             if len(pts) >= max_points:
                 return np.asarray(pts, dtype=np.float32)
     if not pts:
@@ -130,20 +170,35 @@ def _infer_graph(gdf_proj: gpd.GeoDataFrame, snap_m: float = 8.0) -> tuple[Dict[
         }
         return nodes, edges
 
-    # Endpoint snapping fallback.
+    # Endpoint snapping fallback with grid-hash lookup.
     node_coords: list[tuple[float, float]] = []
     edges_out: list[tuple[int, int]] = []
-    tree: cKDTree | None = None
+    snap = float(max(snap_m, 0.1))
+    snap_sq = snap * snap
+    cell = snap
+    buckets: dict[tuple[int, int], list[int]] = {}
+
+    def _cell_key(x: float, y: float) -> tuple[int, int]:
+        return int(np.floor(x / cell)), int(np.floor(y / cell))
 
     def get_or_create_node(x: float, y: float) -> int:
-        nonlocal tree
-        if tree is not None and node_coords:
-            cand = tree.query_ball_point([x, y], r=snap_m)
-            if cand:
-                return int(cand[0])
+        ix, iy = _cell_key(x, y)
+        best_idx = -1
+        best_d2 = snap_sq
+        for bx in (ix - 1, ix, ix + 1):
+            for by in (iy - 1, iy, iy + 1):
+                for nid in buckets.get((bx, by), []):
+                    px, py = node_coords[nid]
+                    d2 = (px - x) ** 2 + (py - y) ** 2
+                    if d2 <= best_d2:
+                        best_idx = nid
+                        best_d2 = d2
+        if best_idx >= 0:
+            return best_idx
         node_coords.append((x, y))
-        tree = cKDTree(np.asarray(node_coords, dtype=np.float64))
-        return len(node_coords) - 1
+        nid = len(node_coords) - 1
+        buckets.setdefault((ix, iy), []).append(nid)
+        return nid
 
     for r in gdf_proj.itertuples(index=False):
         line = r.geometry
@@ -199,24 +254,25 @@ def _degree_hist_similarity(gen_edges: list[tuple[int, int]], gt_edges: list[tup
     }
 
 
+def _intersection_points(nodes: Dict[int, tuple[float, float]], edges: list[tuple[int, int]]) -> np.ndarray:
+    deg = {}
+    for u, v in edges:
+        deg[u] = deg.get(u, 0) + 1
+        deg[v] = deg.get(v, 0) + 1
+    pts = [nodes[n] for n, d in deg.items() if d >= 3 and n in nodes]
+    if not pts:
+        return np.zeros((0, 2), dtype=np.float64)
+    return np.asarray(pts, dtype=np.float64)
+
+
 def _intersection_error(
         gen_nodes: Dict[int, tuple[float, float]],
         gen_edges: list[tuple[int, int]],
         gt_nodes: Dict[int, tuple[float, float]],
         gt_edges: list[tuple[int, int]],
 ) -> dict:
-    def intersection_pts(nodes: Dict[int, tuple[float, float]], edges: list[tuple[int, int]]) -> np.ndarray:
-        deg = {}
-        for u, v in edges:
-            deg[u] = deg.get(u, 0) + 1
-            deg[v] = deg.get(v, 0) + 1
-        pts = [nodes[n] for n, d in deg.items() if d >= 3 and n in nodes]
-        if not pts:
-            return np.zeros((0, 2), dtype=np.float64)
-        return np.asarray(pts, dtype=np.float64)
-
-    g = intersection_pts(gen_nodes, gen_edges)
-    t = intersection_pts(gt_nodes, gt_edges)
+    g = _intersection_points(gen_nodes, gen_edges)
+    t = _intersection_points(gt_nodes, gt_edges)
     if len(g) == 0 or len(t) == 0:
         return {
             "generated_intersection_count": int(len(g)),
@@ -269,6 +325,196 @@ def _hausdorff_summary(gen_proj: gpd.GeoDataFrame, gt_proj: gpd.GeoDataFrame, ma
     }
 
 
+def _normalize_radii(topology_radii_m: Sequence[float] | None) -> tuple[float, ...]:
+    if topology_radii_m is None:
+        vals = [8.0, 15.0]
+    else:
+        vals = [float(v) for v in topology_radii_m]
+    vals = [v for v in vals if np.isfinite(v) and v > 0]
+    if not vals:
+        vals = [8.0, 15.0]
+    return tuple(sorted(set(vals)))
+
+
+def _radius_key(radius_m: float) -> str:
+    return f"{float(radius_m):.1f}"
+
+
+def _to_wgs84_lines(
+        gdf: gpd.GeoDataFrame,
+        *,
+        bbox_file: str | Path | None,
+        apply_bbox: bool,
+) -> gpd.GeoDataFrame:
+    out = gdf.copy()
+    if out.crs is None:
+        out = out.set_crs("EPSG:4326")
+    out = out[out.geometry.notnull()].copy()
+    if apply_bbox and bbox_file is not None:
+        bbox = load_bbox_from_txt(bbox_file)
+        out = clip_line_geometries_to_bbox(out, bbox_wgs84=bbox, geometry_col="geometry")
+    if str(out.crs).upper() != "EPSG:4326":
+        out = out.to_crs("EPSG:4326")
+    out = out[out.geometry.notnull()].copy()
+    out = out[~out.geometry.is_empty].copy()
+    return out.reset_index(drop=True)
+
+
+def _buffer_overlap_length(
+        src_proj: gpd.GeoDataFrame,
+        dst_proj: gpd.GeoDataFrame,
+        *,
+        buffer_m: float,
+        dst_sindex: object | None = None,
+) -> float:
+    if src_proj.empty or dst_proj.empty:
+        return 0.0
+    radius = float(max(buffer_m, 0.0))
+    idx = dst_sindex if dst_sindex is not None else dst_proj.sindex
+    dst_geoms = np.asarray(dst_proj.geometry.values, dtype=object)
+    total = 0.0
+
+    for row in src_proj.itertuples(index=False):
+        g = row.geometry
+        if g is None or g.is_empty:
+            continue
+        minx, miny, maxx, maxy = g.bounds
+        cand = list(idx.intersection((minx - radius, miny - radius, maxx + radius, maxy + radius)))
+        if not cand:
+            continue
+        local = []
+        for j in cand:
+            d = dst_geoms[int(j)]
+            if d is None or d.is_empty:
+                continue
+            local.append(d.buffer(radius))
+        if not local:
+            continue
+        if len(local) == 1:
+            cover = local[0]
+        else:
+            cover = unary_union(local)
+        inter = g.intersection(cover)
+        if inter is not None and not inter.is_empty:
+            total += float(inter.length)
+    return float(total)
+
+
+def _greedy_one_to_one_match_count(src_pts: np.ndarray, dst_pts: np.ndarray, radius_m: float) -> int:
+    if len(src_pts) == 0 or len(dst_pts) == 0:
+        return 0
+    r = float(max(radius_m, 0.0))
+    tree = cKDTree(dst_pts)
+    neighbors = tree.query_ball_point(src_pts, r=r)
+    pairs: list[tuple[float, int, int]] = []
+    for i, cand in enumerate(neighbors):
+        if not cand:
+            continue
+        src = src_pts[i]
+        dst = dst_pts[np.asarray(cand, dtype=np.int64)]
+        d = np.hypot(dst[:, 0] - src[0], dst[:, 1] - src[1])
+        pairs.extend((float(dd), int(i), int(j)) for dd, j in zip(d, cand))
+
+    if not pairs:
+        return 0
+    pairs.sort(key=lambda x: x[0])
+    src_used = np.zeros(len(src_pts), dtype=bool)
+    dst_used = np.zeros(len(dst_pts), dtype=bool)
+    matched = 0
+    for _, i, j in pairs:
+        if src_used[i] or dst_used[j]:
+            continue
+        src_used[i] = True
+        dst_used[j] = True
+        matched += 1
+    return int(matched)
+
+
+def _topo_summary(gen_pts: np.ndarray, gt_pts: np.ndarray, radius_m: float) -> dict:
+    matched = _greedy_one_to_one_match_count(gen_pts, gt_pts, radius_m=radius_m)
+    gp = int(len(gen_pts))
+    tp = int(len(gt_pts))
+    precision = (matched / gp) if gp > 0 else 0.0
+    recall = (matched / tp) if tp > 0 else 0.0
+    f1 = (2.0 * precision * recall / (precision + recall)) if precision > 0 and recall > 0 else 0.0
+    return {
+        "radius_m": float(radius_m),
+        "generated_sample_count": gp,
+        "ground_truth_sample_count": tp,
+        "matched_sample_count": int(matched),
+        "precision": float(precision),
+        "recall": float(recall),
+        "f1": float(f1),
+    }
+
+
+def _exclude_intersection_holes(pts: np.ndarray, intersection_tree: cKDTree | None, radius_m: float) -> np.ndarray:
+    if len(pts) == 0 or intersection_tree is None:
+        return pts
+    d, _ = intersection_tree.query(pts, k=1)
+    return pts[np.asarray(d, dtype=np.float64) > float(radius_m)]
+
+
+def build_evaluation_context(
+        ground_truth_gdf: gpd.GeoDataFrame,
+        *,
+        bbox_file: str | Path | None = None,
+        apply_bbox: bool = False,
+        sample_step_m: float = 10.0,
+        topology_radii_m: Sequence[float] = (8.0, 15.0),
+        snap_m: float = 8.0,
+) -> EvaluationContext:
+    gt = _to_wgs84_lines(ground_truth_gdf, bbox_file=bbox_file, apply_bbox=apply_bbox)
+    if gt.empty:
+        proj_crs = CRS.from_epsg(3857)
+        gt_proj = gpd.GeoDataFrame(gt.copy(), geometry="geometry", crs="EPSG:4326").to_crs(proj_crs)
+        gt_nodes: dict[int, tuple[float, float]] = {}
+        gt_edges: list[tuple[int, int]] = []
+        gt_intersections = np.zeros((0, 2), dtype=np.float64)
+        return EvaluationContext(
+            projected_crs=proj_crs,
+            gt_proj=gt_proj,
+            gt_total_length_m=0.0,
+            gt_sindex=gt_proj.sindex,
+            gt_nodes=gt_nodes,
+            gt_edges=gt_edges,
+            gt_intersections=gt_intersections,
+            gt_intersection_tree=None,
+            apply_bbox=bool(apply_bbox),
+            bbox_file=str(bbox_file) if bbox_file is not None else None,
+            snap_m=float(snap_m),
+            default_sample_step_m=float(sample_step_m),
+            topology_radii_m=_normalize_radii(topology_radii_m),
+        )
+
+    proj_crs = infer_local_projected_crs(list(gt.geometry))
+    gt_proj = gt.to_crs(proj_crs)
+    gt_proj = gt_proj[gt_proj.geometry.notnull()].copy()
+    gt_proj = gt_proj[~gt_proj.geometry.is_empty].copy()
+
+    gt_nodes, gt_edges = _infer_graph(gt_proj, snap_m=float(snap_m))
+    gt_intersections = _intersection_points(gt_nodes, gt_edges)
+    gt_intersection_tree = cKDTree(gt_intersections) if len(gt_intersections) > 0 else None
+
+    context = EvaluationContext(
+        projected_crs=CRS.from_user_input(proj_crs),
+        gt_proj=gt_proj,
+        gt_total_length_m=float(gt_proj.length.sum()),
+        gt_sindex=gt_proj.sindex,
+        gt_nodes=gt_nodes,
+        gt_edges=gt_edges,
+        gt_intersections=gt_intersections,
+        gt_intersection_tree=gt_intersection_tree,
+        apply_bbox=bool(apply_bbox),
+        bbox_file=str(bbox_file) if bbox_file is not None else None,
+        snap_m=float(snap_m),
+        default_sample_step_m=float(sample_step_m),
+        topology_radii_m=_normalize_radii(topology_radii_m),
+    )
+    context.get_gt_sampled_points(sample_step_m)
+    return context
+
+
 def evaluate_centerline_geodataframes(
         generated_gdf: gpd.GeoDataFrame,
         ground_truth_gdf: gpd.GeoDataFrame,
@@ -278,68 +524,127 @@ def evaluate_centerline_geodataframes(
         apply_bbox: bool = False,
         clip_generated_to_ground_truth: bool = False,
         clip_buffer_m: float = 0.0,
+        context: EvaluationContext | None = None,
         compute_topology_metrics: bool = True,
+        compute_itopo: bool = True,
+        topology_radii_m: Sequence[float] = (8.0, 15.0),
         compute_hausdorff: bool = False,
+        return_timing: bool = False,
 ) -> dict:
-    gen = generated_gdf.copy()
-    gt = ground_truth_gdf.copy()
+    timing = {
+        "load_normalize": 0.0,
+        "projection": 0.0,
+        "length_precision_recall": 0.0,
+        "distance_stats": 0.0,
+        "topology": 0.0,
+        "i_topology": 0.0,
+        "hausdorff": 0.0,
+        "total": 0.0,
+    }
+    t_total = time.perf_counter()
 
-    if gen.crs is None:
-        gen = gen.set_crs("EPSG:4326")
-    if gt.crs is None:
-        gt = gt.set_crs("EPSG:4326")
+    t0 = time.perf_counter()
+    gen = _to_wgs84_lines(generated_gdf, bbox_file=bbox_file, apply_bbox=apply_bbox)
 
-    gen = gen[gen.geometry.notnull()].copy()
-    gt = gt[gt.geometry.notnull()].copy()
+    if context is not None:
+        if bool(apply_bbox) != bool(context.apply_bbox):
+            raise ValueError("Evaluation context apply_bbox does not match evaluate call.")
+        if apply_bbox and bbox_file is not None and context.bbox_file is not None:
+            if str(Path(bbox_file)) != str(Path(context.bbox_file)):
+                raise ValueError("Evaluation context bbox_file does not match evaluate call.")
+        gt = None
+    else:
+        gt = _to_wgs84_lines(ground_truth_gdf, bbox_file=bbox_file, apply_bbox=apply_bbox)
+    timing["load_normalize"] = time.perf_counter() - t0
 
-    if apply_bbox and bbox_file is not None:
-        bbox = load_bbox_from_txt(bbox_file)
-        gen = clip_line_geometries_to_bbox(gen, bbox_wgs84=bbox, geometry_col="geometry")
-        gt = clip_line_geometries_to_bbox(gt, bbox_wgs84=bbox, geometry_col="geometry")
+    t0 = time.perf_counter()
+    if context is not None:
+        proj_crs = context.projected_crs
+        gt_proj = context.gt_proj
+        gt_total_len = float(context.gt_total_length_m)
+        gt_sindex = context.gt_sindex
+    else:
+        assert gt is not None
+        if gen.empty or gt.empty:
+            out = {
+                "generated_count": int(len(gen)),
+                "ground_truth_count": int(len(gt)),
+                "error": "One or both datasets are empty.",
+            }
+            timing["total"] = time.perf_counter() - t_total
+            if return_timing:
+                out["timing_sec"] = timing
+            return out
+        proj_crs = infer_local_projected_crs(list(gen.geometry) + list(gt.geometry))
+        gt_proj = gt.to_crs(proj_crs)
+        gt_proj = gt_proj[gt_proj.geometry.notnull()].copy()
+        gt_proj = gt_proj[~gt_proj.geometry.is_empty].copy()
+        gt_total_len = float(gt_proj.length.sum())
+        gt_sindex = gt_proj.sindex
 
-    if gen.empty or gt.empty:
-        return {
+    if gen.empty or gt_proj.empty:
+        out = {
             "generated_count": int(len(gen)),
-            "ground_truth_count": int(len(gt)),
+            "ground_truth_count": int(len(gt_proj)),
             "error": "One or both datasets are empty.",
         }
+        timing["total"] = time.perf_counter() - t_total
+        if return_timing:
+            out["timing_sec"] = timing
+        return out
 
-    if str(gen.crs).upper() != "EPSG:4326":
-        gen = gen.to_crs("EPSG:4326")
-    if str(gt.crs).upper() != "EPSG:4326":
-        gt = gt.to_crs("EPSG:4326")
-
-    proj_crs = infer_local_projected_crs(list(gen.geometry) + list(gt.geometry))
     gen_proj = gen.to_crs(proj_crs)
-    gt_proj = gt.to_crs(proj_crs)
-
     gen_proj = gen_proj[gen_proj.geometry.notnull()].copy()
-    gt_proj = gt_proj[gt_proj.geometry.notnull()].copy()
+    gen_proj = gen_proj[~gen_proj.geometry.is_empty].copy()
 
-    if clip_generated_to_ground_truth and not gt_proj.empty:
+    if clip_generated_to_ground_truth and not gt_proj.empty and not gen_proj.empty:
         minx, miny, maxx, maxy = gt_proj.total_bounds
         clip_poly = box(minx, miny, maxx, maxy).buffer(float(clip_buffer_m))
         gen_proj["geometry"] = gen_proj.geometry.map(lambda g: g.intersection(clip_poly) if g is not None else None)
         gen_proj = gen_proj[gen_proj.geometry.notnull()].copy()
         gen_proj = gen_proj[~gen_proj.geometry.is_empty].copy()
+    timing["projection"] = time.perf_counter() - t0
 
+    if gen_proj.empty or gt_proj.empty:
+        out = {
+            "generated_count": int(len(gen_proj)),
+            "ground_truth_count": int(len(gt_proj)),
+            "error": "One or both datasets are empty.",
+        }
+        timing["total"] = time.perf_counter() - t_total
+        if return_timing:
+            out["timing_sec"] = timing
+        return out
+
+    t0 = time.perf_counter()
     gen_total_len = float(gen_proj.length.sum())
-    gt_total_len = float(gt_proj.length.sum())
-
-    gt_buffer_union = unary_union(gt_proj.buffer(buffer_m).to_list())
-    gen_buffer_union = unary_union(gen_proj.buffer(buffer_m).to_list())
-
-    matched_gen_len = float(gen_proj.geometry.intersection(gt_buffer_union).length.sum())
-    matched_gt_len = float(gt_proj.geometry.intersection(gen_buffer_union).length.sum())
-
+    matched_gen_len = _buffer_overlap_length(
+        gen_proj,
+        gt_proj,
+        buffer_m=buffer_m,
+        dst_sindex=gt_sindex,
+    )
+    gen_sindex = gen_proj.sindex
+    matched_gt_len = _buffer_overlap_length(
+        gt_proj,
+        gen_proj,
+        buffer_m=buffer_m,
+        dst_sindex=gen_sindex,
+    )
     precision = (matched_gen_len / gen_total_len) if gen_total_len > 0 else float("nan")
     recall = (matched_gt_len / gt_total_len) if gt_total_len > 0 else float("nan")
     f1 = 2.0 * precision * recall / (precision + recall) if precision > 0 and recall > 0 else 0.0
+    timing["length_precision_recall"] = time.perf_counter() - t0
 
+    t0 = time.perf_counter()
     gen_pts = _sample_points(gen_proj.geometry, step_m=sample_step_m)
-    gt_pts = _sample_points(gt_proj.geometry, step_m=sample_step_m)
+    if context is not None:
+        gt_pts = context.get_gt_sampled_points(sample_step_m)
+    else:
+        gt_pts = _sample_points(gt_proj.geometry, step_m=sample_step_m)
     gen_to_gt = _nn_stats(gen_pts, gt_pts)
     gt_to_gen = _nn_stats(gt_pts, gen_pts)
+    timing["distance_stats"] = time.perf_counter() - t0
 
     metrics = {
         "projected_crs": str(proj_crs),
@@ -363,9 +668,14 @@ def evaluate_centerline_geodataframes(
     }
 
     if compute_topology_metrics:
-        gen_nodes, gen_edges = _infer_graph(gen_proj)
-        gt_nodes, gt_edges = _infer_graph(gt_proj)
-        metrics["topology"] = {
+        t0 = time.perf_counter()
+        gen_nodes, gen_edges = _infer_graph(gen_proj, snap_m=context.snap_m if context is not None else 8.0)
+        if context is not None:
+            gt_nodes, gt_edges = context.gt_nodes, context.gt_edges
+        else:
+            gt_nodes, gt_edges = _infer_graph(gt_proj, snap_m=8.0)
+
+        topology = {
             **_degree_hist_similarity(gen_edges, gt_edges),
             "intersection_location_error_m": _intersection_error(gen_nodes, gen_edges, gt_nodes, gt_edges),
             "generated_node_count": int(len(gen_nodes)),
@@ -373,10 +683,46 @@ def evaluate_centerline_geodataframes(
             "generated_edge_count": int(len(gen_edges)),
             "ground_truth_edge_count": int(len(gt_edges)),
         }
+        radii = _normalize_radii(topology_radii_m if topology_radii_m else (context.topology_radii_m if context is not None else (8.0, 15.0)))
+        topo_by_radius = {}
+        for rr in radii:
+            topo_by_radius[_radius_key(rr)] = _topo_summary(gen_pts, gt_pts, radius_m=rr)
+        topology["topo"] = {"by_radius_m": topo_by_radius}
+        timing["topology"] = time.perf_counter() - t0
+
+        if compute_itopo:
+            t0 = time.perf_counter()
+            gen_intersections = _intersection_points(gen_nodes, gen_edges)
+            gen_inter_tree = cKDTree(gen_intersections) if len(gen_intersections) > 0 else None
+            if context is not None:
+                gt_inter_tree = context.gt_intersection_tree
+                gt_inter_count = int(len(context.gt_intersections))
+            else:
+                gt_intersections = _intersection_points(gt_nodes, gt_edges)
+                gt_inter_tree = cKDTree(gt_intersections) if len(gt_intersections) > 0 else None
+                gt_inter_count = int(len(gt_intersections))
+
+            itopo_by_radius = {}
+            for rr in radii:
+                gen_itopo_pts = _exclude_intersection_holes(gen_pts, gen_inter_tree, rr)
+                gt_itopo_pts = _exclude_intersection_holes(gt_pts, gt_inter_tree, rr)
+                itopo_by_radius[_radius_key(rr)] = _topo_summary(gen_itopo_pts, gt_itopo_pts, radius_m=rr)
+            topology["i_topo"] = {
+                "generated_intersection_count": int(len(gen_intersections)),
+                "ground_truth_intersection_count": gt_inter_count,
+                "by_radius_m": itopo_by_radius,
+            }
+            timing["i_topology"] = time.perf_counter() - t0
+        metrics["topology"] = topology
 
     if compute_hausdorff:
+        t0 = time.perf_counter()
         metrics["hausdorff_m"] = _hausdorff_summary(gen_proj, gt_proj)
+        timing["hausdorff"] = time.perf_counter() - t0
 
+    timing["total"] = time.perf_counter() - t_total
+    if return_timing:
+        metrics["timing_sec"] = timing
     return metrics
 
 
@@ -392,7 +738,10 @@ def evaluate_centerlines(
         clip_generated_to_ground_truth: bool = False,
         clip_buffer_m: float = 0.0,
         compute_topology_metrics: bool = True,
+        compute_itopo: bool = True,
+        topology_radii_m: Sequence[float] = (8.0, 15.0),
         compute_hausdorff: bool = False,
+        return_timing: bool = False,
 ) -> dict:
     gen = _load_line_geodata(generated_centerlines, layer=generated_layer)
 
@@ -404,6 +753,14 @@ def evaluate_centerlines(
     else:
         gt = _load_line_geodata(ground_truth_navstreet, layer=ground_truth_layer)
 
+    context = build_evaluation_context(
+        gt,
+        bbox_file=bbox_file,
+        apply_bbox=apply_bbox,
+        sample_step_m=sample_step_m,
+        topology_radii_m=topology_radii_m,
+    )
+
     return evaluate_centerline_geodataframes(
         generated_gdf=gen,
         ground_truth_gdf=gt,
@@ -413,8 +770,12 @@ def evaluate_centerlines(
         apply_bbox=apply_bbox,
         clip_generated_to_ground_truth=clip_generated_to_ground_truth,
         clip_buffer_m=clip_buffer_m,
+        context=context,
         compute_topology_metrics=compute_topology_metrics,
+        compute_itopo=compute_itopo,
+        topology_radii_m=topology_radii_m,
         compute_hausdorff=compute_hausdorff,
+        return_timing=return_timing,
     )
 
 

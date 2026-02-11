@@ -71,7 +71,7 @@ conda activate here-env
 To ensure your environment is ready, run:
 
 ```powershell
-python main.py
+python scripts/preprocess_traces.py --help
 ```
 
 ---
@@ -166,7 +166,10 @@ python scripts/evaluate_centerlines.py `
   --ground-truth-layer navstreet `
   --out outputs/evaluation/roadster_metrics.json `
   --compute-topology-metrics `
+  --compute-itopo `
+  --topology-radii-m 8,15 `
   --compute-hausdorff `
+  --return-timing `
   --plots-out-dir outputs/evaluation/plots `
   --plot-stem roadster_eval
 ```

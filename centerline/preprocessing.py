@@ -401,6 +401,9 @@ def preprocess_traces_dataframe(
                     "sensor_quality_score": float(getattr(row, "sensor_quality_score"))
                     if pd.notnull(getattr(row, "sensor_quality_score", np.nan))
                     else np.nan,
+                    "hpd_median_speed": float(getattr(row, "hpd_median_speed"))
+                    if pd.notnull(getattr(row, "hpd_median_speed", np.nan))
+                    else np.nan,
                 }
             )
             seg_id += 1

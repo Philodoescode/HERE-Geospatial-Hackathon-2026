@@ -26,6 +26,11 @@ from shapely.geometry import LineString
 from shapely.ops import transform
 
 from .base import AlgorithmConfig, BaseCenterlineAlgorithm
+from ..dynamic_weighting import DynamicWeightConfig, apply_dynamic_weighting_to_edges
+from ..postprocess_deepmg_kharita import (
+    DeepMGPostprocessConfig,
+    run_deepmg_kharita_postprocess,
+)
 from ..utils import (
     angle_diff_deg,
     interpolate_altitudes,
@@ -77,6 +82,30 @@ class KharitaConfig(AlgorithmConfig):
     candidate_low_weighted_support: float = 5.0
     candidate_dangling_max_length_m: float = 35.0
     candidate_dangling_min_weighted_support: float = 8.0
+
+    # Dynamic VPD/probe weighting
+    enable_dynamic_weighting: bool = False
+    dyn_lambda_vpd: float = 1.6
+    dyn_probe_repeatability_days_min: int = 2
+    dyn_probe_heading_entropy_max_deg: float = 35.0
+    dyn_probe_speed_cv_max: float = 0.65
+    dyn_road_likeness_beta: float = 6.0
+    dyn_road_likeness_tau: float = 0.45
+
+    # DeepMG-inspired topology postprocess
+    enable_deepmg_topology_postprocess: bool = False
+    post_link_radius_m: float | None = None
+    post_alpha_virtual: float = 1.4
+    post_min_supp_virtual: int | None = None
+    post_pred_min_supp: int = 1
+    post_similar_direction_deg: float = 20.0
+    post_no_new_vertex_offset_m: float = 15.0
+    post_mm_snap_m: float = 15.0
+    post_max_virtual_links_per_node: int = 2
+    post_enable_duplicate_merge: bool = True
+    post_dup_eps_m: float = 3.0
+    post_enable_curve_smoothing: bool = True
+    post_curve_lambda: float = 0.2
 
 
 # ---------------------------------------------------------------------------
@@ -267,7 +296,8 @@ def _candidate_selection(centerlines: pd.DataFrame, config: KharitaConfig) -> pd
 
     length_m = pd.to_numeric(out.get("length_m", 0.0), errors="coerce").fillna(0.0).to_numpy(dtype=np.float64)
     endpoint_dist_m = pd.to_numeric(out.get("endpoint_dist_m", 0.0), errors="coerce").fillna(0.0).to_numpy(dtype=np.float64)
-    weighted_support = pd.to_numeric(out.get("weighted_support", 0.0), errors="coerce").fillna(0.0).to_numpy(dtype=np.float64)
+    support_col = "effective_support" if "effective_support" in out.columns else "weighted_support"
+    weighted_support = pd.to_numeric(out.get(support_col, 0.0), errors="coerce").fillna(0.0).to_numpy(dtype=np.float64)
 
     safe_len = np.maximum(length_m, 1e-6)
     sinuosity = length_m / np.maximum(endpoint_dist_m, 1e-6)
@@ -327,6 +357,7 @@ def _candidate_selection(centerlines: pd.DataFrame, config: KharitaConfig) -> pd
     out["support_density"] = support_density
     out["sinuosity"] = sinuosity
     out["curvature_proxy"] = curvature_proxy
+    out["support_metric"] = weighted_support
     out["is_selected"] = selected
     out["selection_score"] = score
     out["selection_reason"] = reasons
@@ -399,6 +430,42 @@ class KharitaAlgorithm(BaseCenterlineAlgorithm):
         g.add_argument("--candidate-low-weighted-support", type=float, default=5.0)
         g.add_argument("--candidate-dangling-max-length-m", type=float, default=35.0)
         g.add_argument("--candidate-dangling-min-weighted-support", type=float, default=8.0)
+        g.add_argument(
+            "--enable-dynamic-weighting",
+            action=argparse.BooleanOptionalAction,
+            default=False,
+        )
+        g.add_argument("--dyn-lambda-vpd", type=float, default=1.6)
+        g.add_argument("--dyn-probe-repeatability-days-min", type=int, default=2)
+        g.add_argument("--dyn-probe-heading-entropy-max-deg", type=float, default=35.0)
+        g.add_argument("--dyn-probe-speed-cv-max", type=float, default=0.65)
+        g.add_argument("--dyn-road-likeness-beta", type=float, default=6.0)
+        g.add_argument("--dyn-road-likeness-tau", type=float, default=0.45)
+        g.add_argument(
+            "--enable-deepmg-topology-postprocess",
+            action=argparse.BooleanOptionalAction,
+            default=False,
+        )
+        g.add_argument("--post-link-radius-m", type=float, default=None)
+        g.add_argument("--post-alpha-virtual", type=float, default=1.4)
+        g.add_argument("--post-min-supp-virtual", type=int, default=None)
+        g.add_argument("--post-pred-min-supp", type=int, default=1)
+        g.add_argument("--post-similar-direction-deg", type=float, default=20.0)
+        g.add_argument("--post-no-new-vertex-offset-m", type=float, default=15.0)
+        g.add_argument("--post-mm-snap-m", type=float, default=15.0)
+        g.add_argument("--post-max-virtual-links-per-node", type=int, default=2)
+        g.add_argument(
+            "--post-enable-duplicate-merge",
+            action=argparse.BooleanOptionalAction,
+            default=True,
+        )
+        g.add_argument("--post-dup-eps-m", type=float, default=3.0)
+        g.add_argument(
+            "--post-enable-curve-smoothing",
+            action=argparse.BooleanOptionalAction,
+            default=True,
+        )
+        g.add_argument("--post-curve-lambda", type=float, default=0.2)
         g.add_argument("--min-centerline-length-m", type=float, default=12.0)
         g.add_argument("--smooth-iterations", type=int, default=2)
 
@@ -499,6 +566,11 @@ class KharitaAlgorithm(BaseCenterlineAlgorithm):
                 "hour": int(row["hour"])
                 if pd.notnull(row.get("hour", np.nan))
                 else None,
+                "path_quality_score": float(path_q) if pd.notnull(path_q) else np.nan,
+                "sensor_quality_score": float(sensor_q) if pd.notnull(sensor_q) else np.nan,
+                "hpd_median_speed": float(row.get("hpd_median_speed"))
+                if pd.notnull(row.get("hpd_median_speed", np.nan))
+                else np.nan,
             }
             next_trace_id += 1
 
@@ -560,6 +632,18 @@ class KharitaAlgorithm(BaseCenterlineAlgorithm):
                         "crosswalk_types": set(),
                         "day_counter": Counter(),
                         "hour_counter": Counter(),
+                        "path_quality_sum": 0.0,
+                        "path_quality_count": 0.0,
+                        "sensor_quality_sum": 0.0,
+                        "sensor_quality_count": 0.0,
+                        "hpd_speed_sum": 0.0,
+                        "hpd_speed_sq_sum": 0.0,
+                        "hpd_speed_count": 0.0,
+                        "heading_sin_sum": 0.0,
+                        "heading_cos_sum": 0.0,
+                        "heading_count": 0.0,
+                        "is_virtual": False,
+                        "postprocess_tags": set(),
                     }
 
                 s = edge_support[key]
@@ -587,13 +671,65 @@ class KharitaAlgorithm(BaseCenterlineAlgorithm):
                     s["day_counter"][int(meta["day"])] += 1
                 if meta.get("hour") is not None:
                     s["hour_counter"][int(meta["hour"])] += 1
+                pq = meta.get("path_quality_score", np.nan)
+                sq = meta.get("sensor_quality_score", np.nan)
+                if pd.notnull(pq):
+                    s["path_quality_sum"] += float(np.clip(pq, 0.0, 1.0))
+                    s["path_quality_count"] += 1.0
+                if pd.notnull(sq):
+                    s["sensor_quality_sum"] += float(np.clip(sq, 0.0, 1.0))
+                    s["sensor_quality_count"] += 1.0
+                if str(meta["source"]).upper() == "HPD":
+                    hs = meta.get("hpd_median_speed", np.nan)
+                    if pd.notnull(hs):
+                        s["hpd_speed_sum"] += float(hs)
+                        s["hpd_speed_sq_sum"] += float(hs) * float(hs)
+                        s["hpd_speed_count"] += 1.0
+                h_step = float(heading_arr[i])
+                s["heading_sin_sum"] += math.sin(math.radians(h_step))
+                s["heading_cos_sum"] += math.cos(math.radians(h_step))
+                s["heading_count"] += 1.0
+
+        if nodes.empty:
+            return {
+                "projected_crs": projected_crs,
+                "nodes": pd.DataFrame(),
+                "edges": pd.DataFrame(),
+                "centerlines": pd.DataFrame(),
+                "trace_count": len(trace_ranges),
+                "sample_point_count": len(x_arr),
+            }
+
+        node_xy = {
+            int(r.node_id): (float(r.x), float(r.y))
+            for r in nodes.itertuples(index=False)
+        }
+        dyn_cfg = DynamicWeightConfig(
+            enabled=bool(config.enable_dynamic_weighting),
+            lambda_vpd=float(config.dyn_lambda_vpd),
+            probe_repeatability_days_min=int(config.dyn_probe_repeatability_days_min),
+            probe_heading_entropy_max_deg=float(config.dyn_probe_heading_entropy_max_deg),
+            probe_speed_cv_max=float(config.dyn_probe_speed_cv_max),
+            road_likeness_beta=float(config.dyn_road_likeness_beta),
+            road_likeness_tau=float(config.dyn_road_likeness_tau),
+        )
+        apply_dynamic_weighting_to_edges(
+            edge_support=edge_support,
+            node_xy=node_xy,
+            config=dyn_cfg,
+        )
+
+        def _prune_support_value(stats: dict) -> float:
+            if config.enable_dynamic_weighting:
+                return float(stats.get("effective_support", stats.get("support", 0.0)) or 0.0)
+            return float(stats.get("support", 0.0) or 0.0)
 
         # -- Edge pruning ---------------------------------------------------
         # Pass 1: minimum support
         edge_support = {
             k: v
             for k, v in edge_support.items()
-            if v["support"] >= config.min_edge_support
+            if _prune_support_value(v) >= config.min_edge_support
         }
 
         # Pass 2: direction conflict
@@ -602,16 +738,12 @@ class KharitaAlgorithm(BaseCenterlineAlgorithm):
             if (v, u) not in edge_support:
                 continue
             sr = edge_support[(v, u)]
-            if sv["support"] < sr["support"] * config.reverse_edge_ratio:
+            if _prune_support_value(sv) < _prune_support_value(sr) * config.reverse_edge_ratio:
                 to_drop.add((u, v))
         for k in to_drop:
             edge_support.pop(k, None)
 
         # Pass 3: transitive pruning
-        node_xy = {
-            int(r.node_id): (float(r.x), float(r.y))
-            for r in nodes.itertuples(index=False)
-        }
         edge_lengths = {
             (u, v): float(
                 math.hypot(
@@ -629,7 +761,7 @@ class KharitaAlgorithm(BaseCenterlineAlgorithm):
         if config.enable_transitive_pruning and config.transitive_max_checks > 0:
             candidates = sorted(
                 edge_support.keys(),
-                key=lambda e: (edge_support[e]["support"], -edge_lengths[e]),
+                key=lambda e: (_prune_support_value(edge_support[e]), -edge_lengths[e]),
             )[: config.transitive_max_checks]
 
             dropped_transitive = set()
@@ -653,17 +785,39 @@ class KharitaAlgorithm(BaseCenterlineAlgorithm):
             for e in dropped_transitive:
                 edge_support.pop(e, None)
 
-        # -- Output nodes (WGS84) ------------------------------------------
-        if nodes.empty:
-            return {
-                "projected_crs": projected_crs,
-                "nodes": pd.DataFrame(),
-                "edges": pd.DataFrame(),
-                "centerlines": pd.DataFrame(),
-                "trace_count": len(trace_ranges),
-                "sample_point_count": len(x_arr),
-            }
+        # DeepMG-inspired topology postprocess (vector adaptation).
+        post_cfg = DeepMGPostprocessConfig(
+            enabled=bool(config.enable_deepmg_topology_postprocess),
+            link_radius_m=config.post_link_radius_m,
+            alpha_virtual=float(config.post_alpha_virtual),
+            min_supp_virtual=config.post_min_supp_virtual,
+            pred_min_supp=int(config.post_pred_min_supp),
+            similar_direction_deg=float(config.post_similar_direction_deg),
+            no_new_vertex_offset_m=float(config.post_no_new_vertex_offset_m),
+            mm_snap_m=float(config.post_mm_snap_m),
+            max_virtual_links_per_node=int(config.post_max_virtual_links_per_node),
+            enable_duplicate_merge=bool(config.post_enable_duplicate_merge),
+            dup_eps_m=float(config.post_dup_eps_m),
+            enable_curve_smoothing=bool(config.post_enable_curve_smoothing),
+            curve_lambda=float(config.post_curve_lambda),
+        )
+        run_deepmg_kharita_postprocess(
+            edge_support=edge_support,
+            node_xy=node_xy,
+            labels=labels,
+            trace_ranges=trace_ranges,
+            sample_point_count=len(x_arr),
+            config=post_cfg,
+        )
 
+        # Refresh dynamic fields after postprocess modifications.
+        apply_dynamic_weighting_to_edges(
+            edge_support=edge_support,
+            node_xy=node_xy,
+            config=dyn_cfg,
+        )
+
+        # -- Output nodes (WGS84) ------------------------------------------
         lon, lat = to_wgs.transform(nodes["x"].to_numpy(), nodes["y"].to_numpy())
         nodes = nodes.copy()
         nodes["lon"] = lon
@@ -694,6 +848,10 @@ class KharitaAlgorithm(BaseCenterlineAlgorithm):
                     "v": v,
                     "support": float(s["support"]),
                     "weighted_support": float(s["weighted_support"]),
+                    "effective_support": float(s.get("effective_support", s["weighted_support"])),
+                    "dyn_w_probe": float(s.get("dyn_w_probe", 0.0)),
+                    "dyn_w_vpd": float(s.get("dyn_w_vpd", 1.0)),
+                    "road_likeness_score": float(s.get("road_likeness_score", 0.5)),
                     "vpd_support": float(s["vpd_support"]),
                     "hpd_support": float(s["hpd_support"]),
                     "mean_step_length_m": float(s["length_sum"] / support),
@@ -708,6 +866,8 @@ class KharitaAlgorithm(BaseCenterlineAlgorithm):
                     "day_mode": day_mode,
                     "hour_mode": hour_mode,
                     "dir_travel": dir_travel,
+                    "is_virtual_link": bool(s.get("is_virtual", False)),
+                    "postprocess_tags": sorted(list(s.get("postprocess_tags", set()))),
                     "geometry": line_wgs,
                 }
             )
@@ -730,6 +890,15 @@ class KharitaAlgorithm(BaseCenterlineAlgorithm):
                     turn_deg=float(config.turn_smoothing_deg),
                     neighbor_weight=float(config.turn_smoothing_neighbor_weight),
                 )
+                if config.enable_deepmg_topology_postprocess and config.post_enable_curve_smoothing:
+                    smooth_xy = smooth_polyline_preserve_turns(
+                        smooth_xy,
+                        passes=1,
+                        turn_deg=float(config.turn_smoothing_deg),
+                        neighbor_weight=float(
+                            np.clip(config.post_curve_lambda * 0.5, 0.05, 0.35)
+                        ),
+                    )
 
             line_xy = LineString([(float(x), float(y)) for x, y in smooth_xy])
             if line_xy.length < config.min_centerline_length_m:
@@ -746,6 +915,7 @@ class KharitaAlgorithm(BaseCenterlineAlgorithm):
             rv = 0.0
             support_sum = 0.0
             weighted_support_sum = 0.0
+            effective_support_sum = 0.0
             construction_sum = 0.0
             signal_sum = 0.0
             alt_sum = 0.0
@@ -753,6 +923,12 @@ class KharitaAlgorithm(BaseCenterlineAlgorithm):
             crosswalk: set = set()
             day_counter: Counter = Counter()
             hour_counter: Counter = Counter()
+            dyn_probe_wsum = 0.0
+            dyn_vpd_wsum = 0.0
+            road_like_wsum = 0.0
+            dyn_w = 0.0
+            has_virtual = False
+            post_tags: set[str] = set()
 
             for i in range(1, len(path_nodes)):
                 a = path_nodes[i - 1]
@@ -762,6 +938,7 @@ class KharitaAlgorithm(BaseCenterlineAlgorithm):
                     fw += es["support"]
                     support_sum += es["support"]
                     weighted_support_sum += es["weighted_support"]
+                    effective_support_sum += float(es.get("effective_support", es["weighted_support"]))
                     construction_sum += es["construction_sum"]
                     signal_sum += es["traffic_signal_sum"]
                     alt_sum += es["altitude_sum"]
@@ -769,11 +946,19 @@ class KharitaAlgorithm(BaseCenterlineAlgorithm):
                     crosswalk.update(es["crosswalk_types"])
                     day_counter.update(es["day_counter"])
                     hour_counter.update(es["hour_counter"])
+                    w_es = float(max(es.get("effective_support", 0.0), 1e-6))
+                    dyn_probe_wsum += float(es.get("dyn_w_probe", 0.0)) * w_es
+                    dyn_vpd_wsum += float(es.get("dyn_w_vpd", 1.0)) * w_es
+                    road_like_wsum += float(es.get("road_likeness_score", 0.5)) * w_es
+                    dyn_w += w_es
+                    has_virtual = has_virtual or bool(es.get("is_virtual", False))
+                    post_tags.update(es.get("postprocess_tags", set()))
                 if (b, a) in edge_support:
                     es = edge_support[(b, a)]
                     rv += es["support"]
                     support_sum += es["support"]
                     weighted_support_sum += es["weighted_support"]
+                    effective_support_sum += float(es.get("effective_support", es["weighted_support"]))
                     construction_sum += es["construction_sum"]
                     signal_sum += es["traffic_signal_sum"]
                     alt_sum += es["altitude_sum"]
@@ -781,6 +966,13 @@ class KharitaAlgorithm(BaseCenterlineAlgorithm):
                     crosswalk.update(es["crosswalk_types"])
                     day_counter.update(es["day_counter"])
                     hour_counter.update(es["hour_counter"])
+                    w_es = float(max(es.get("effective_support", 0.0), 1e-6))
+                    dyn_probe_wsum += float(es.get("dyn_w_probe", 0.0)) * w_es
+                    dyn_vpd_wsum += float(es.get("dyn_w_vpd", 1.0)) * w_es
+                    road_like_wsum += float(es.get("road_likeness_score", 0.5)) * w_es
+                    dyn_w += w_es
+                    has_virtual = has_virtual or bool(es.get("is_virtual", False))
+                    post_tags.update(es.get("postprocess_tags", set()))
 
             if support_sum <= 0:
                 continue
@@ -797,6 +989,10 @@ class KharitaAlgorithm(BaseCenterlineAlgorithm):
                     "node_path": path_nodes,
                     "support": float(support_sum),
                     "weighted_support": float(weighted_support_sum),
+                    "effective_support": float(effective_support_sum),
+                    "dyn_w_probe": float(dyn_probe_wsum / max(dyn_w, 1e-6)),
+                    "dyn_w_vpd": float(dyn_vpd_wsum / max(dyn_w, 1e-6)),
+                    "road_likeness_score": float(road_like_wsum / max(dyn_w, 1e-6)),
                     "construction_percent_mean": float(construction_sum / support_sum),
                     "traffic_signal_count_mean": float(signal_sum / support_sum),
                     "altitude_mean": float(alt_sum / alt_count)
@@ -814,6 +1010,8 @@ class KharitaAlgorithm(BaseCenterlineAlgorithm):
                     "v": int(path_nodes[-1]),
                     "length_m": float(line_xy.length),
                     "endpoint_dist_m": endpoint_dist_m,
+                    "is_virtual_link": bool(has_virtual),
+                    "postprocess_tags": sorted(list(post_tags)),
                     "geometry": line_wgs,
                 }
             )

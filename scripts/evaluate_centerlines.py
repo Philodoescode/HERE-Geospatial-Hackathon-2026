@@ -25,6 +25,13 @@ def find_default_ground_truth() -> Path:
     return fallback
 
 
+def _parse_float_list(text: str) -> tuple[float, ...]:
+    vals = [float(tok.strip()) for tok in str(text).split(",") if tok.strip()]
+    if not vals:
+        raise ValueError(f"Expected non-empty numeric list, got: {text}")
+    return tuple(vals)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Evaluate generated centerlines against HERE navstreet ground truth.")
     parser.add_argument(
@@ -52,6 +59,17 @@ def main() -> None:
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Compute node-degree similarity and intersection-location error metrics.",
+    )
+    parser.add_argument(
+        "--compute-itopo",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Compute intersection-sensitive I-TOPO summary.",
+    )
+    parser.add_argument(
+        "--topology-radii-m",
+        default="8,15",
+        help="Comma-separated topology radii in meters for TOPO/I-TOPO.",
     )
     parser.add_argument(
         "--compute-hausdorff",
@@ -95,9 +113,16 @@ def main() -> None:
         default="centerline_eval",
         help="Filename stem for plot outputs.",
     )
+    parser.add_argument(
+        "--return-timing",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Include stage-level timing in metrics JSON output.",
+    )
     args = parser.parse_args()
 
     gt = args.ground_truth or find_default_ground_truth()
+    topology_radii = _parse_float_list(args.topology_radii_m)
 
     metrics = evaluate_centerlines(
         generated_centerlines=args.generated,
@@ -111,7 +136,10 @@ def main() -> None:
         clip_generated_to_ground_truth=args.clip_generated_to_ground_truth,
         clip_buffer_m=args.clip_buffer_m,
         compute_topology_metrics=args.compute_topology_metrics,
+        compute_itopo=args.compute_itopo,
+        topology_radii_m=topology_radii,
         compute_hausdorff=args.compute_hausdorff,
+        return_timing=args.return_timing,
     )
     save_metrics(metrics, args.out)
 

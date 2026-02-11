@@ -17,7 +17,11 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from centerline.algorithms.kharita import KharitaAlgorithm, KharitaConfig
-from centerline.evaluation import evaluate_centerline_geodataframes
+from centerline.evaluation import (
+    EvaluationContext,
+    build_evaluation_context,
+    evaluate_centerline_geodataframes,
+)
 from centerline.generation import generate_centerlines_with_algorithm, save_centerline_outputs
 from centerline.io_utils import load_navstreet_csv
 
@@ -73,14 +77,28 @@ def _load_ground_truth(path: Path, layer: str) -> gpd.GeoDataFrame:
     return gt
 
 
+def _get_nested_float(payload: dict, path: list[str], default: float = 0.0) -> float:
+    cur = payload
+    for key in path:
+        if not isinstance(cur, dict) or key not in cur:
+            return float(default)
+        cur = cur[key]
+    try:
+        return float(cur)
+    except Exception:
+        return float(default)
+
+
 def _evaluate_result(
     result: dict,
     gt_gdf: gpd.GeoDataFrame,
     *,
+    eval_context: EvaluationContext | None,
     bbox_file: Path | None,
     apply_bbox: bool,
     buffer_m: float,
     sample_step_m: float,
+    topology_radii_m: tuple[float, ...],
 ) -> dict:
     center = result.get("centerlines", pd.DataFrame())
     if len(center) == 0:
@@ -92,6 +110,7 @@ def _evaluate_result(
             "length_precision": 0.0,
             "length_recall": 0.0,
             "length_f1": 0.0,
+            "topology": {},
         }
     center_gdf = gpd.GeoDataFrame(center.copy(), geometry="geometry", crs="EPSG:4326")
     return evaluate_centerline_geodataframes(
@@ -103,7 +122,10 @@ def _evaluate_result(
         apply_bbox=apply_bbox,
         clip_generated_to_ground_truth=False,
         clip_buffer_m=0.0,
-        compute_topology_metrics=False,
+        context=eval_context,
+        compute_topology_metrics=True,
+        compute_itopo=True,
+        topology_radii_m=topology_radii_m,
         compute_hausdorff=False,
     )
 
@@ -162,8 +184,10 @@ def _run_variant(
     max_vpd_rows: int | None,
     max_hpd_rows_per_file: int | None,
     gt_gdf: gpd.GeoDataFrame,
+    eval_context: EvaluationContext | None,
     buffer_m: float,
     sample_step_m: float,
+    topology_radii_m: tuple[float, ...],
 ) -> tuple[dict, dict]:
     algo = KharitaAlgorithm(config=cfg)
     result = generate_centerlines_with_algorithm(
@@ -179,10 +203,12 @@ def _run_variant(
     metrics = _evaluate_result(
         result,
         gt_gdf,
+        eval_context=eval_context,
         bbox_file=bbox_file,
         apply_bbox=apply_bbox,
         buffer_m=buffer_m,
         sample_step_m=sample_step_m,
+        topology_radii_m=topology_radii_m,
     )
     return result, metrics
 
@@ -254,6 +280,14 @@ def main() -> None:
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
     gt_gdf = _load_ground_truth(args.ground_truth, args.ground_truth_layer)
+    topology_radii_m = (8.0, 15.0)
+    eval_context = build_evaluation_context(
+        gt_gdf,
+        bbox_file=args.bbox_file,
+        apply_bbox=args.apply_bbox,
+        sample_step_m=args.sample_step_m,
+        topology_radii_m=topology_radii_m,
+    )
 
     space = {
         "cluster_radius_m": _parse_float_list(args.cluster_radius_values),
@@ -296,8 +330,10 @@ def main() -> None:
                 max_vpd_rows=args.max_vpd_rows,
                 max_hpd_rows_per_file=args.max_hpd_rows_per_file,
                 gt_gdf=gt_gdf,
+                eval_context=eval_context,
                 buffer_m=args.buffer_m,
                 sample_step_m=args.sample_step_m,
+                topology_radii_m=topology_radii_m,
             )
             score, precision, recall, length_ratio = _trial_score(
                 metrics,
@@ -306,6 +342,10 @@ def main() -> None:
                 precision_penalty=args.precision_penalty,
                 length_penalty=args.length_penalty,
             )
+            topo_f1_8 = _get_nested_float(metrics, ["topology", "topo", "by_radius_m", "8.0", "f1"])
+            topo_f1_15 = _get_nested_float(metrics, ["topology", "topo", "by_radius_m", "15.0", "f1"])
+            itopo_f1_8 = _get_nested_float(metrics, ["topology", "i_topo", "by_radius_m", "8.0", "f1"])
+            itopo_f1_15 = _get_nested_float(metrics, ["topology", "i_topo", "by_radius_m", "15.0", "f1"])
             row = {
                 "trial": idx,
                 **p,
@@ -315,6 +355,10 @@ def main() -> None:
                 "length_precision": precision,
                 "length_recall": recall,
                 "length_f1": float(metrics.get("length_f1", 0.0) or 0.0),
+                "topo_f1_r8": topo_f1_8,
+                "topo_f1_r15": topo_f1_15,
+                "i_topo_f1_r8": itopo_f1_8,
+                "i_topo_f1_r15": itopo_f1_15,
                 "length_ratio": length_ratio,
                 "objective_score": score,
                 "elapsed_sec": time.time() - t0,
@@ -326,6 +370,7 @@ def main() -> None:
                 best = row
             print(
                 f"[trial {idx}/{len(trials)}] score={score:.6f} f1={row['length_f1']:.6f} "
+                f"topo8={topo_f1_8:.6f} itopo8={itopo_f1_8:.6f} "
                 f"p={precision:.6f} r={recall:.6f} n={row['centerline_count']}"
             )
         except Exception as ex:
@@ -338,6 +383,10 @@ def main() -> None:
                 "length_precision": 0.0,
                 "length_recall": 0.0,
                 "length_f1": 0.0,
+                "topo_f1_r8": 0.0,
+                "topo_f1_r15": 0.0,
+                "i_topo_f1_r8": 0.0,
+                "i_topo_f1_r15": 0.0,
                 "length_ratio": float("inf"),
                 "objective_score": -1e9,
                 "elapsed_sec": time.time() - t0,
@@ -378,8 +427,10 @@ def main() -> None:
             max_vpd_rows=args.max_vpd_rows,
             max_hpd_rows_per_file=args.max_hpd_rows_per_file,
             gt_gdf=gt_gdf,
+            eval_context=eval_context,
             buffer_m=args.buffer_m,
             sample_step_m=args.sample_step_m,
+            topology_radii_m=topology_radii_m,
         )
         files = save_centerline_outputs(best_result, args.out_dir, stem="best_kharita_dynamic")
         print("Saved best outputs:")
@@ -388,10 +439,18 @@ def main() -> None:
 
     # Ablations with best tuned base.
     variants = {
-        "baseline": best_cfg.__class__(**{**best_cfg.__dict__, "enable_dynamic_weighting": False, "enable_deepmg_topology_postprocess": False}),
-        "dynamic_only": best_cfg.__class__(**{**best_cfg.__dict__, "enable_dynamic_weighting": True, "enable_deepmg_topology_postprocess": False}),
-        "postprocess_only": best_cfg.__class__(**{**best_cfg.__dict__, "enable_dynamic_weighting": False, "enable_deepmg_topology_postprocess": True}),
-        "combined": best_cfg.__class__(**{**best_cfg.__dict__, "enable_dynamic_weighting": True, "enable_deepmg_topology_postprocess": True}),
+        "baseline": best_cfg.__class__(
+            **{**best_cfg.__dict__, "enable_dynamic_weighting": False, "enable_deepmg_topology_postprocess": False}
+        ),
+        "dynamic_only": best_cfg.__class__(
+            **{**best_cfg.__dict__, "enable_dynamic_weighting": True, "enable_deepmg_topology_postprocess": False}
+        ),
+        "postprocess_only": best_cfg.__class__(
+            **{**best_cfg.__dict__, "enable_dynamic_weighting": False, "enable_deepmg_topology_postprocess": True}
+        ),
+        "combined": best_cfg.__class__(
+            **{**best_cfg.__dict__, "enable_dynamic_weighting": True, "enable_deepmg_topology_postprocess": True}
+        ),
     }
     ablation_metrics = {}
     for name, cfg in variants.items():
@@ -404,8 +463,10 @@ def main() -> None:
             max_vpd_rows=args.max_vpd_rows,
             max_hpd_rows_per_file=args.max_hpd_rows_per_file,
             gt_gdf=gt_gdf,
+            eval_context=eval_context,
             buffer_m=args.buffer_m,
             sample_step_m=args.sample_step_m,
+            topology_radii_m=topology_radii_m,
         )
         ablation_metrics[name] = metrics
     ablation_path = args.out_dir / "ablation_metrics.json"

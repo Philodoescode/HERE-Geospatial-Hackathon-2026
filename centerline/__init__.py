@@ -6,7 +6,7 @@ from .generation import (
     generate_centerlines_with_algorithm,
     save_centerline_outputs,
 )
-from .evaluation import evaluate_centerlines
+from .evaluation import build_evaluation_context, evaluate_centerlines
 from .algorithms import (
     BaseCenterlineAlgorithm,
     get_algorithm,
