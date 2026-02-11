@@ -22,7 +22,10 @@ from centerline.evaluation import (
     build_evaluation_context,
     evaluate_centerline_geodataframes,
 )
-from centerline.generation import generate_centerlines_with_algorithm, save_centerline_outputs
+from centerline.generation import (
+    generate_centerlines_with_algorithm,
+    save_centerline_outputs,
+)
 from centerline.io_utils import load_navstreet_csv
 
 
@@ -59,11 +62,16 @@ def _parse_bool_list(text: str) -> list[bool]:
     return vals
 
 
-def _build_trials(space: dict[str, list], search: str, n_trials: int, seed: int) -> list[dict]:
+def _build_trials(
+    space: dict[str, list], search: str, n_trials: int, seed: int
+) -> list[dict]:
     rng = random.Random(seed)
     keys = list(space.keys())
     if search == "grid":
-        return [dict(zip(keys, vals)) for vals in itertools.product(*(space[k] for k in keys))]
+        return [
+            dict(zip(keys, vals))
+            for vals in itertools.product(*(space[k] for k in keys))
+        ]
     return [{k: rng.choice(space[k]) for k in keys} for _ in range(n_trials)]
 
 
@@ -146,7 +154,7 @@ def _trial_score(
     length_ratio = (generated_len / gt_len) if gt_len > 0 else float("inf")
     p_gap = max(0.0, precision_floor - precision)
     lr_gap = max(0.0, length_ratio - max_length_ratio)
-    score = f1 - precision_penalty * (p_gap ** 2) - length_penalty * (lr_gap ** 2)
+    score = f1 - precision_penalty * (p_gap**2) - length_penalty * (lr_gap**2)
     return score, precision, recall, length_ratio
 
 
@@ -165,12 +173,6 @@ def _build_config(p: dict) -> KharitaConfig:
         dyn_lambda_vpd=float(p["dyn_lambda_vpd"]),
         dyn_road_likeness_beta=float(p["dyn_road_likeness_beta"]),
         dyn_road_likeness_tau=float(p["dyn_road_likeness_tau"]),
-        enable_deepmg_topology_postprocess=bool(p["enable_deepmg_topology_postprocess"]),
-        post_link_radius_m=float(p["post_link_radius_m"]) if p["post_link_radius_m"] >= 0 else None,
-        post_alpha_virtual=float(p["post_alpha_virtual"]),
-        post_min_supp_virtual=int(p["post_min_supp_virtual"]) if int(p["post_min_supp_virtual"]) >= 0 else None,
-        post_mm_snap_m=float(p["post_mm_snap_m"]),
-        post_dup_eps_m=float(p["post_dup_eps_m"]),
     )
 
 
@@ -228,17 +230,30 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Tune Kharita dynamic weighting + DeepMG-inspired topology postprocess."
     )
-    parser.add_argument("--vpd-csv", type=Path, default=Path("data/Kosovo_VPD/Kosovo_VPD.csv"))
+    parser.add_argument(
+        "--vpd-csv", type=Path, default=Path("data/Kosovo_VPD/Kosovo_VPD.csv")
+    )
     parser.add_argument(
         "--hpd-csvs",
         type=Path,
         nargs="+",
-        default=[Path("data/Kosovo_HPD/XKO_HPD_week_1.csv"), Path("data/Kosovo_HPD/XKO_HPD_week_2.csv")],
+        default=[
+            Path("data/Kosovo_HPD/XKO_HPD_week_1.csv"),
+            Path("data/Kosovo_HPD/XKO_HPD_week_2.csv"),
+        ],
     )
-    parser.add_argument("--ground-truth", type=Path, default=Path("data/Kosovo's nav streets/nav_kosovo.gpkg"))
+    parser.add_argument(
+        "--ground-truth",
+        type=Path,
+        default=Path("data/Kosovo's nav streets/nav_kosovo.gpkg"),
+    )
     parser.add_argument("--ground-truth-layer", default="Kosovo22")
-    parser.add_argument("--bbox-file", type=Path, default=Path("data/Kosovo_bounding_box.txt"))
-    parser.add_argument("--apply-bbox", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--bbox-file", type=Path, default=Path("data/Kosovo_bounding_box.txt")
+    )
+    parser.add_argument(
+        "--apply-bbox", action=argparse.BooleanOptionalAction, default=True
+    )
     parser.add_argument("--max-vpd-rows", type=int, default=1500)
     parser.add_argument("--max-hpd-rows-per-file", type=int, default=50000)
     parser.add_argument("--search", choices=["random", "grid"], default="random")
@@ -260,13 +275,6 @@ def main() -> None:
     parser.add_argument("--dyn-road-likeness-beta-values", default="4,6,8")
     parser.add_argument("--dyn-road-likeness-tau-values", default="0.35,0.45,0.55")
 
-    parser.add_argument("--enable-deepmg-topology-postprocess-values", default="true,false")
-    parser.add_argument("--post-link-radius-values", default="-1,50,75,100")  # -1 => auto
-    parser.add_argument("--post-alpha-virtual-values", default="1.2,1.4,1.8")
-    parser.add_argument("--post-min-supp-virtual-values", default="-1,2,3,5")  # -1 => auto
-    parser.add_argument("--post-mm-snap-values", default="12,15,20")
-    parser.add_argument("--post-dup-eps-values", default="2,3,4")
-
     parser.add_argument("--buffer-m", type=float, default=15.0)
     parser.add_argument("--sample-step-m", type=float, default=10.0)
     parser.add_argument("--precision-floor", type=float, default=0.25)
@@ -274,8 +282,12 @@ def main() -> None:
     parser.add_argument("--precision-penalty", type=float, default=1.5)
     parser.add_argument("--length-penalty", type=float, default=0.7)
 
-    parser.add_argument("--out-dir", type=Path, default=Path("outputs/tuning_kharita_dynamic"))
-    parser.add_argument("--save-best-output", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--out-dir", type=Path, default=Path("outputs/tuning_kharita_dynamic")
+    )
+    parser.add_argument(
+        "--save-best-output", action=argparse.BooleanOptionalAction, default=True
+    )
     args = parser.parse_args()
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
@@ -292,25 +304,29 @@ def main() -> None:
     space = {
         "cluster_radius_m": _parse_float_list(args.cluster_radius_values),
         "heading_tolerance_deg": _parse_float_list(args.heading_tolerance_values),
-        "heading_distance_weight_m": _parse_float_list(args.heading_distance_weight_values),
+        "heading_distance_weight_m": _parse_float_list(
+            args.heading_distance_weight_values
+        ),
         "min_edge_support": _parse_float_list(args.min_edge_support_values),
         "reverse_edge_ratio": _parse_float_list(args.reverse_edge_ratio_values),
         "sample_spacing_m": _parse_float_list(args.sample_spacing_values),
         "max_points_per_trace": _parse_int_list(args.max_points_per_trace_values),
-        "candidate_selection_threshold": _parse_float_list(args.candidate_selection_threshold_values),
-        "candidate_density_scale": _parse_float_list(args.candidate_density_scale_values),
-        "enable_dynamic_weighting": _parse_bool_list(args.enable_dynamic_weighting_values),
+        "candidate_selection_threshold": _parse_float_list(
+            args.candidate_selection_threshold_values
+        ),
+        "candidate_density_scale": _parse_float_list(
+            args.candidate_density_scale_values
+        ),
+        "enable_dynamic_weighting": _parse_bool_list(
+            args.enable_dynamic_weighting_values
+        ),
         "dyn_lambda_vpd": _parse_float_list(args.dyn_lambda_vpd_values),
         "dyn_road_likeness_beta": _parse_float_list(args.dyn_road_likeness_beta_values),
         "dyn_road_likeness_tau": _parse_float_list(args.dyn_road_likeness_tau_values),
-        "enable_deepmg_topology_postprocess": _parse_bool_list(args.enable_deepmg_topology_postprocess_values),
-        "post_link_radius_m": _parse_float_list(args.post_link_radius_values),
-        "post_alpha_virtual": _parse_float_list(args.post_alpha_virtual_values),
-        "post_min_supp_virtual": _parse_int_list(args.post_min_supp_virtual_values),
-        "post_mm_snap_m": _parse_float_list(args.post_mm_snap_values),
-        "post_dup_eps_m": _parse_float_list(args.post_dup_eps_values),
     }
-    trials = _build_trials(space=space, search=args.search, n_trials=args.trials, seed=args.seed)
+    trials = _build_trials(
+        space=space, search=args.search, n_trials=args.trials, seed=args.seed
+    )
 
     print(f"run_started_at: {run_start_dt.isoformat()}")
     print(f"trials_planned: {len(trials)}")
@@ -342,10 +358,18 @@ def main() -> None:
                 precision_penalty=args.precision_penalty,
                 length_penalty=args.length_penalty,
             )
-            topo_f1_8 = _get_nested_float(metrics, ["topology", "topo", "by_radius_m", "8.0", "f1"])
-            topo_f1_15 = _get_nested_float(metrics, ["topology", "topo", "by_radius_m", "15.0", "f1"])
-            itopo_f1_8 = _get_nested_float(metrics, ["topology", "i_topo", "by_radius_m", "8.0", "f1"])
-            itopo_f1_15 = _get_nested_float(metrics, ["topology", "i_topo", "by_radius_m", "15.0", "f1"])
+            topo_f1_8 = _get_nested_float(
+                metrics, ["topology", "topo", "by_radius_m", "8.0", "f1"]
+            )
+            topo_f1_15 = _get_nested_float(
+                metrics, ["topology", "topo", "by_radius_m", "15.0", "f1"]
+            )
+            itopo_f1_8 = _get_nested_float(
+                metrics, ["topology", "i_topo", "by_radius_m", "8.0", "f1"]
+            )
+            itopo_f1_15 = _get_nested_float(
+                metrics, ["topology", "i_topo", "by_radius_m", "15.0", "f1"]
+            )
             row = {
                 "trial": idx,
                 **p,
@@ -396,7 +420,9 @@ def main() -> None:
             rows.append(row)
             print(f"[trial {idx}/{len(trials)}] failed: {ex}")
 
-    df = pd.DataFrame(rows).sort_values(["objective_score", "length_f1"], ascending=False)
+    df = pd.DataFrame(rows).sort_values(
+        ["objective_score", "length_f1"], ascending=False
+    )
     csv_path = args.out_dir / "tuning_results.csv"
     df.to_csv(csv_path, index=False)
 
@@ -432,7 +458,9 @@ def main() -> None:
             sample_step_m=args.sample_step_m,
             topology_radii_m=topology_radii_m,
         )
-        files = save_centerline_outputs(best_result, args.out_dir, stem="best_kharita_dynamic")
+        files = save_centerline_outputs(
+            best_result, args.out_dir, stem="best_kharita_dynamic"
+        )
         print("Saved best outputs:")
         for k, v in files.items():
             print(f"  {k}: {v}")
@@ -440,16 +468,16 @@ def main() -> None:
     # Ablations with best tuned base.
     variants = {
         "baseline": best_cfg.__class__(
-            **{**best_cfg.__dict__, "enable_dynamic_weighting": False, "enable_deepmg_topology_postprocess": False}
+            **{
+                **best_cfg.__dict__,
+                "enable_dynamic_weighting": False,
+            }
         ),
         "dynamic_only": best_cfg.__class__(
-            **{**best_cfg.__dict__, "enable_dynamic_weighting": True, "enable_deepmg_topology_postprocess": False}
-        ),
-        "postprocess_only": best_cfg.__class__(
-            **{**best_cfg.__dict__, "enable_dynamic_weighting": False, "enable_deepmg_topology_postprocess": True}
-        ),
-        "combined": best_cfg.__class__(
-            **{**best_cfg.__dict__, "enable_dynamic_weighting": True, "enable_deepmg_topology_postprocess": True}
+            **{
+                **best_cfg.__dict__,
+                "enable_dynamic_weighting": True,
+            }
         ),
     }
     ablation_metrics = {}

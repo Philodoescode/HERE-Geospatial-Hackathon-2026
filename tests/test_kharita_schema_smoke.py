@@ -7,7 +7,9 @@ from shapely.geometry import LineString
 from centerline.algorithms.kharita import KharitaAlgorithm, KharitaConfig
 
 
-def _trace_row(trace_id: str, source: str, geom: LineString, day: int, hour: int) -> dict:
+def _trace_row(
+    trace_id: str, source: str, geom: LineString, day: int, hour: int
+) -> dict:
     return {
         "trace_id": trace_id,
         "source": source,
@@ -52,10 +54,6 @@ def test_kharita_outputs_dynamic_and_postprocess_columns() -> None:
         min_edge_support=1.0,
         max_transition_distance_m=120.0,
         enable_dynamic_weighting=True,
-        enable_deepmg_topology_postprocess=True,
-        post_link_radius_m=50.0,
-        post_min_supp_virtual=1,
-        post_pred_min_supp=1,
     )
     out = KharitaAlgorithm(config=cfg).generate(
         traces=traces,
@@ -71,8 +69,6 @@ def test_kharita_outputs_dynamic_and_postprocess_columns() -> None:
             "dyn_w_probe",
             "dyn_w_vpd",
             "road_likeness_score",
-            "is_virtual_link",
-            "postprocess_tags",
         ]:
             assert c in out["edges"].columns
     if not out["centerlines"].empty:
@@ -81,8 +77,5 @@ def test_kharita_outputs_dynamic_and_postprocess_columns() -> None:
             "dyn_w_probe",
             "dyn_w_vpd",
             "road_likeness_score",
-            "is_virtual_link",
-            "postprocess_tags",
         ]:
             assert c in out["centerlines"].columns
-

@@ -63,8 +63,8 @@ def _safe_temporal_repeatability(edge_stats: dict, days_min: int) -> float:
 
 def _safe_vpd_quality(edge_stats: dict) -> float:
     support = float(edge_stats.get("support", 0.0) or 0.0)
-    construction_mean = (
-        float(edge_stats.get("construction_sum", 0.0) or 0.0) / max(support, 1.0)
+    construction_mean = float(edge_stats.get("construction_sum", 0.0) or 0.0) / max(
+        support, 1.0
     )
     construction_quality = float(np.clip(1.0 - (construction_mean / 100.0), 0.0, 1.0))
 
@@ -169,13 +169,23 @@ def apply_dynamic_weighting_to_edges(
         w_probe_raw = (
             (probe_support * probe_consistency) / denom if denom > 0.0 else 0.5
         )
-        gate = _sigmoid(config.road_likeness_beta * (road_likeness - config.road_likeness_tau))
+        gate = _sigmoid(
+            config.road_likeness_beta * (road_likeness - config.road_likeness_tau)
+        )
         w_probe = float(np.clip(w_probe_raw * gate, 0.0, 1.0))
         w_vpd = float(np.clip(1.0 - w_probe, 0.0, 1.0))
 
         if config.enabled:
             source_factor = 0.8 + 0.4 * max(w_probe, w_vpd)
             quality_factor = 0.35 + 0.65 * road_likeness
+
+            # Low-VPD Rescue (per increase-recall.md):
+            # If a segment is likely a small road (low VPD) but has high-quality
+            # probe data (consistent heading/speed/repeatability), we boost its
+            # quality score to prevent it from being pruned.
+            if vpd_support < 5.0 and probe_consistency > 0.60:
+                quality_factor = max(quality_factor, 0.85)
+
             effective_support = weighted_support * source_factor * quality_factor
         else:
             effective_support = weighted_support
@@ -186,4 +196,3 @@ def apply_dynamic_weighting_to_edges(
         s["probe_consistency"] = probe_consistency
         s["vpd_quality"] = vpd_quality
         s["effective_support"] = float(max(effective_support, 0.0))
-

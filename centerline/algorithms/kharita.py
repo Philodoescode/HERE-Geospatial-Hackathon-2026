@@ -27,10 +27,6 @@ from shapely.ops import transform
 
 from .base import AlgorithmConfig, BaseCenterlineAlgorithm
 from ..dynamic_weighting import DynamicWeightConfig, apply_dynamic_weighting_to_edges
-from ..postprocess_deepmg_kharita import (
-    DeepMGPostprocessConfig,
-    run_deepmg_kharita_postprocess,
-)
 from ..utils import (
     angle_diff_deg,
     interpolate_altitudes,
@@ -92,21 +88,6 @@ class KharitaConfig(AlgorithmConfig):
     dyn_road_likeness_beta: float = 6.0
     dyn_road_likeness_tau: float = 0.45
 
-    # DeepMG-inspired topology postprocess
-    enable_deepmg_topology_postprocess: bool = False
-    post_link_radius_m: float | None = None
-    post_alpha_virtual: float = 1.4
-    post_min_supp_virtual: int | None = None
-    post_pred_min_supp: int = 1
-    post_similar_direction_deg: float = 20.0
-    post_no_new_vertex_offset_m: float = 15.0
-    post_mm_snap_m: float = 15.0
-    post_max_virtual_links_per_node: int = 2
-    post_enable_duplicate_merge: bool = True
-    post_dup_eps_m: float = 3.0
-    post_enable_curve_smoothing: bool = True
-    post_curve_lambda: float = 0.2
-
 
 # ---------------------------------------------------------------------------
 # Clustering core
@@ -114,11 +95,11 @@ class KharitaConfig(AlgorithmConfig):
 
 
 def _kharita_style_incremental_clustering(
-        xs: np.ndarray,
-        ys: np.ndarray,
-        headings: np.ndarray,
-        point_weights: np.ndarray,
-        config: KharitaConfig,
+    xs: np.ndarray,
+    ys: np.ndarray,
+    headings: np.ndarray,
+    point_weights: np.ndarray,
+    config: KharitaConfig,
 ) -> Tuple[np.ndarray, pd.DataFrame]:
     """Heading-aware radius clustering adapted from Kharita/Kharita*."""
     n = len(xs)
@@ -266,7 +247,7 @@ def _kharita_style_incremental_clustering(
                 "x": s["xw"] / ww,
                 "y": s["yw"] / ww,
                 "heading": (math.degrees(math.atan2(s["sinw"], s["cosw"])) + 360.0)
-                           % 360.0,
+                % 360.0,
                 "weight": s["w"],
                 "point_count": s["n"],
             }
@@ -274,7 +255,9 @@ def _kharita_style_incremental_clustering(
     return labels, pd.DataFrame(rows)
 
 
-def _candidate_selection(centerlines: pd.DataFrame, config: KharitaConfig) -> pd.DataFrame:
+def _candidate_selection(
+    centerlines: pd.DataFrame, config: KharitaConfig
+) -> pd.DataFrame:
     out = centerlines.copy()
     if out.empty:
         out["is_selected"] = pd.Series(dtype=bool)
@@ -294,21 +277,45 @@ def _candidate_selection(centerlines: pd.DataFrame, config: KharitaConfig) -> pd
     v_deg = np.asarray([float(deg.get(int(vv), 0)) for vv in v], dtype=np.float64)
     dangling = ((u_deg <= 1.0) | (v_deg <= 1.0)).astype(np.float64)
 
-    length_m = pd.to_numeric(out.get("length_m", 0.0), errors="coerce").fillna(0.0).to_numpy(dtype=np.float64)
-    endpoint_dist_m = pd.to_numeric(out.get("endpoint_dist_m", 0.0), errors="coerce").fillna(0.0).to_numpy(dtype=np.float64)
-    support_col = "effective_support" if "effective_support" in out.columns else "weighted_support"
-    weighted_support = pd.to_numeric(out.get(support_col, 0.0), errors="coerce").fillna(0.0).to_numpy(dtype=np.float64)
+    length_m = (
+        pd.to_numeric(out.get("length_m", 0.0), errors="coerce")
+        .fillna(0.0)
+        .to_numpy(dtype=np.float64)
+    )
+    endpoint_dist_m = (
+        pd.to_numeric(out.get("endpoint_dist_m", 0.0), errors="coerce")
+        .fillna(0.0)
+        .to_numpy(dtype=np.float64)
+    )
+    support_col = (
+        "effective_support"
+        if "effective_support" in out.columns
+        else "weighted_support"
+    )
+    weighted_support = (
+        pd.to_numeric(out.get(support_col, 0.0), errors="coerce")
+        .fillna(0.0)
+        .to_numpy(dtype=np.float64)
+    )
 
     safe_len = np.maximum(length_m, 1e-6)
     sinuosity = length_m / np.maximum(endpoint_dist_m, 1e-6)
     curvature_proxy = np.clip((length_m - endpoint_dist_m) / safe_len, 0.0, 1.0)
     support_density = weighted_support / safe_len
 
-    support_n = np.clip(weighted_support / max(config.candidate_force_keep_weighted_support, 1e-6), 0.0, 1.0)
-    density_n = np.clip(support_density / max(config.candidate_density_scale, 1e-6), 0.0, 1.0)
+    support_n = np.clip(
+        weighted_support / max(config.candidate_force_keep_weighted_support, 1e-6),
+        0.0,
+        1.0,
+    )
+    density_n = np.clip(
+        support_density / max(config.candidate_density_scale, 1e-6), 0.0, 1.0
+    )
     length_n = np.clip(length_m / max(config.candidate_length_scale_m, 1e-6), 0.0, 1.0)
     connectivity_n = np.clip((u_deg + v_deg) / 8.0, 0.0, 1.0)
-    connectivity_n = np.where(dangling > 0.0, connectivity_n * 0.35, np.maximum(connectivity_n, 0.65))
+    connectivity_n = np.where(
+        dangling > 0.0, connectivity_n * 0.35, np.maximum(connectivity_n, 0.65)
+    )
     straight_like = np.clip(1.0 - np.abs(sinuosity - 1.15) / 1.6, 0.0, 1.0)
     curve_like = np.clip(curvature_proxy / 0.20, 0.0, 1.0)
     geom_n = np.maximum(0.6 * straight_like + 0.4 * curve_like, curve_like)
@@ -425,11 +432,15 @@ class KharitaAlgorithm(BaseCenterlineAlgorithm):
         g.add_argument("--candidate-selection-threshold", type=float, default=0.52)
         g.add_argument("--candidate-length-scale-m", type=float, default=70.0)
         g.add_argument("--candidate-density-scale", type=float, default=0.25)
-        g.add_argument("--candidate-force-keep-weighted-support", type=float, default=18.0)
+        g.add_argument(
+            "--candidate-force-keep-weighted-support", type=float, default=18.0
+        )
         g.add_argument("--candidate-short-length-m", type=float, default=10.0)
         g.add_argument("--candidate-low-weighted-support", type=float, default=5.0)
         g.add_argument("--candidate-dangling-max-length-m", type=float, default=35.0)
-        g.add_argument("--candidate-dangling-min-weighted-support", type=float, default=8.0)
+        g.add_argument(
+            "--candidate-dangling-min-weighted-support", type=float, default=8.0
+        )
         g.add_argument(
             "--enable-dynamic-weighting",
             action=argparse.BooleanOptionalAction,
@@ -441,31 +452,6 @@ class KharitaAlgorithm(BaseCenterlineAlgorithm):
         g.add_argument("--dyn-probe-speed-cv-max", type=float, default=0.65)
         g.add_argument("--dyn-road-likeness-beta", type=float, default=6.0)
         g.add_argument("--dyn-road-likeness-tau", type=float, default=0.45)
-        g.add_argument(
-            "--enable-deepmg-topology-postprocess",
-            action=argparse.BooleanOptionalAction,
-            default=False,
-        )
-        g.add_argument("--post-link-radius-m", type=float, default=None)
-        g.add_argument("--post-alpha-virtual", type=float, default=1.4)
-        g.add_argument("--post-min-supp-virtual", type=int, default=None)
-        g.add_argument("--post-pred-min-supp", type=int, default=1)
-        g.add_argument("--post-similar-direction-deg", type=float, default=20.0)
-        g.add_argument("--post-no-new-vertex-offset-m", type=float, default=15.0)
-        g.add_argument("--post-mm-snap-m", type=float, default=15.0)
-        g.add_argument("--post-max-virtual-links-per-node", type=int, default=2)
-        g.add_argument(
-            "--post-enable-duplicate-merge",
-            action=argparse.BooleanOptionalAction,
-            default=True,
-        )
-        g.add_argument("--post-dup-eps-m", type=float, default=3.0)
-        g.add_argument(
-            "--post-enable-curve-smoothing",
-            action=argparse.BooleanOptionalAction,
-            default=True,
-        )
-        g.add_argument("--post-curve-lambda", type=float, default=0.2)
         g.add_argument("--min-centerline-length-m", type=float, default=12.0)
         g.add_argument("--smooth-iterations", type=int, default=2)
 
@@ -487,11 +473,11 @@ class KharitaAlgorithm(BaseCenterlineAlgorithm):
     # -- Core algorithm -----------------------------------------------------
 
     def generate(
-            self,
-            traces: pd.DataFrame,
-            projected_crs: CRS,
-            to_proj: Transformer,
-            to_wgs: Transformer,
+        self,
+        traces: pd.DataFrame,
+        projected_crs: CRS,
+        to_proj: Transformer,
+        to_wgs: Transformer,
     ) -> dict:
         config = self.config
 
@@ -567,7 +553,9 @@ class KharitaAlgorithm(BaseCenterlineAlgorithm):
                 if pd.notnull(row.get("hour", np.nan))
                 else None,
                 "path_quality_score": float(path_q) if pd.notnull(path_q) else np.nan,
-                "sensor_quality_score": float(sensor_q) if pd.notnull(sensor_q) else np.nan,
+                "sensor_quality_score": float(sensor_q)
+                if pd.notnull(sensor_q)
+                else np.nan,
                 "hpd_median_speed": float(row.get("hpd_median_speed"))
                 if pd.notnull(row.get("hpd_median_speed", np.nan))
                 else np.nan,
@@ -642,8 +630,6 @@ class KharitaAlgorithm(BaseCenterlineAlgorithm):
                         "heading_sin_sum": 0.0,
                         "heading_cos_sum": 0.0,
                         "heading_count": 0.0,
-                        "is_virtual": False,
-                        "postprocess_tags": set(),
                     }
 
                 s = edge_support[key]
@@ -708,7 +694,9 @@ class KharitaAlgorithm(BaseCenterlineAlgorithm):
             enabled=bool(config.enable_dynamic_weighting),
             lambda_vpd=float(config.dyn_lambda_vpd),
             probe_repeatability_days_min=int(config.dyn_probe_repeatability_days_min),
-            probe_heading_entropy_max_deg=float(config.dyn_probe_heading_entropy_max_deg),
+            probe_heading_entropy_max_deg=float(
+                config.dyn_probe_heading_entropy_max_deg
+            ),
             probe_speed_cv_max=float(config.dyn_probe_speed_cv_max),
             road_likeness_beta=float(config.dyn_road_likeness_beta),
             road_likeness_tau=float(config.dyn_road_likeness_tau),
@@ -721,7 +709,9 @@ class KharitaAlgorithm(BaseCenterlineAlgorithm):
 
         def _prune_support_value(stats: dict) -> float:
             if config.enable_dynamic_weighting:
-                return float(stats.get("effective_support", stats.get("support", 0.0)) or 0.0)
+                return float(
+                    stats.get("effective_support", stats.get("support", 0.0)) or 0.0
+                )
             return float(stats.get("support", 0.0) or 0.0)
 
         # -- Edge pruning ---------------------------------------------------
@@ -738,7 +728,10 @@ class KharitaAlgorithm(BaseCenterlineAlgorithm):
             if (v, u) not in edge_support:
                 continue
             sr = edge_support[(v, u)]
-            if _prune_support_value(sv) < _prune_support_value(sr) * config.reverse_edge_ratio:
+            if (
+                _prune_support_value(sv)
+                < _prune_support_value(sr) * config.reverse_edge_ratio
+            ):
                 to_drop.add((u, v))
         for k in to_drop:
             edge_support.pop(k, None)
@@ -785,31 +778,6 @@ class KharitaAlgorithm(BaseCenterlineAlgorithm):
             for e in dropped_transitive:
                 edge_support.pop(e, None)
 
-        # DeepMG-inspired topology postprocess (vector adaptation).
-        post_cfg = DeepMGPostprocessConfig(
-            enabled=bool(config.enable_deepmg_topology_postprocess),
-            link_radius_m=config.post_link_radius_m,
-            alpha_virtual=float(config.post_alpha_virtual),
-            min_supp_virtual=config.post_min_supp_virtual,
-            pred_min_supp=int(config.post_pred_min_supp),
-            similar_direction_deg=float(config.post_similar_direction_deg),
-            no_new_vertex_offset_m=float(config.post_no_new_vertex_offset_m),
-            mm_snap_m=float(config.post_mm_snap_m),
-            max_virtual_links_per_node=int(config.post_max_virtual_links_per_node),
-            enable_duplicate_merge=bool(config.post_enable_duplicate_merge),
-            dup_eps_m=float(config.post_dup_eps_m),
-            enable_curve_smoothing=bool(config.post_enable_curve_smoothing),
-            curve_lambda=float(config.post_curve_lambda),
-        )
-        run_deepmg_kharita_postprocess(
-            edge_support=edge_support,
-            node_xy=node_xy,
-            labels=labels,
-            trace_ranges=trace_ranges,
-            sample_point_count=len(x_arr),
-            config=post_cfg,
-        )
-
         # Refresh dynamic fields after postprocess modifications.
         apply_dynamic_weighting_to_edges(
             edge_support=edge_support,
@@ -848,7 +816,9 @@ class KharitaAlgorithm(BaseCenterlineAlgorithm):
                     "v": v,
                     "support": float(s["support"]),
                     "weighted_support": float(s["weighted_support"]),
-                    "effective_support": float(s.get("effective_support", s["weighted_support"])),
+                    "effective_support": float(
+                        s.get("effective_support", s["weighted_support"])
+                    ),
                     "dyn_w_probe": float(s.get("dyn_w_probe", 0.0)),
                     "dyn_w_vpd": float(s.get("dyn_w_vpd", 1.0)),
                     "road_likeness_score": float(s.get("road_likeness_score", 0.5)),
@@ -866,8 +836,6 @@ class KharitaAlgorithm(BaseCenterlineAlgorithm):
                     "day_mode": day_mode,
                     "hour_mode": hour_mode,
                     "dir_travel": dir_travel,
-                    "is_virtual_link": bool(s.get("is_virtual", False)),
-                    "postprocess_tags": sorted(list(s.get("postprocess_tags", set()))),
                     "geometry": line_wgs,
                 }
             )
@@ -890,15 +858,6 @@ class KharitaAlgorithm(BaseCenterlineAlgorithm):
                     turn_deg=float(config.turn_smoothing_deg),
                     neighbor_weight=float(config.turn_smoothing_neighbor_weight),
                 )
-                if config.enable_deepmg_topology_postprocess and config.post_enable_curve_smoothing:
-                    smooth_xy = smooth_polyline_preserve_turns(
-                        smooth_xy,
-                        passes=1,
-                        turn_deg=float(config.turn_smoothing_deg),
-                        neighbor_weight=float(
-                            np.clip(config.post_curve_lambda * 0.5, 0.05, 0.35)
-                        ),
-                    )
 
             line_xy = LineString([(float(x), float(y)) for x, y in smooth_xy])
             if line_xy.length < config.min_centerline_length_m:
@@ -927,8 +886,6 @@ class KharitaAlgorithm(BaseCenterlineAlgorithm):
             dyn_vpd_wsum = 0.0
             road_like_wsum = 0.0
             dyn_w = 0.0
-            has_virtual = False
-            post_tags: set[str] = set()
 
             for i in range(1, len(path_nodes)):
                 a = path_nodes[i - 1]
@@ -938,7 +895,9 @@ class KharitaAlgorithm(BaseCenterlineAlgorithm):
                     fw += es["support"]
                     support_sum += es["support"]
                     weighted_support_sum += es["weighted_support"]
-                    effective_support_sum += float(es.get("effective_support", es["weighted_support"]))
+                    effective_support_sum += float(
+                        es.get("effective_support", es["weighted_support"])
+                    )
                     construction_sum += es["construction_sum"]
                     signal_sum += es["traffic_signal_sum"]
                     alt_sum += es["altitude_sum"]
@@ -951,14 +910,14 @@ class KharitaAlgorithm(BaseCenterlineAlgorithm):
                     dyn_vpd_wsum += float(es.get("dyn_w_vpd", 1.0)) * w_es
                     road_like_wsum += float(es.get("road_likeness_score", 0.5)) * w_es
                     dyn_w += w_es
-                    has_virtual = has_virtual or bool(es.get("is_virtual", False))
-                    post_tags.update(es.get("postprocess_tags", set()))
                 if (b, a) in edge_support:
                     es = edge_support[(b, a)]
                     rv += es["support"]
                     support_sum += es["support"]
                     weighted_support_sum += es["weighted_support"]
-                    effective_support_sum += float(es.get("effective_support", es["weighted_support"]))
+                    effective_support_sum += float(
+                        es.get("effective_support", es["weighted_support"])
+                    )
                     construction_sum += es["construction_sum"]
                     signal_sum += es["traffic_signal_sum"]
                     alt_sum += es["altitude_sum"]
@@ -971,8 +930,6 @@ class KharitaAlgorithm(BaseCenterlineAlgorithm):
                     dyn_vpd_wsum += float(es.get("dyn_w_vpd", 1.0)) * w_es
                     road_like_wsum += float(es.get("road_likeness_score", 0.5)) * w_es
                     dyn_w += w_es
-                    has_virtual = has_virtual or bool(es.get("is_virtual", False))
-                    post_tags.update(es.get("postprocess_tags", set()))
 
             if support_sum <= 0:
                 continue
@@ -1010,8 +967,6 @@ class KharitaAlgorithm(BaseCenterlineAlgorithm):
                     "v": int(path_nodes[-1]),
                     "length_m": float(line_xy.length),
                     "endpoint_dist_m": endpoint_dist_m,
-                    "is_virtual_link": bool(has_virtual),
-                    "postprocess_tags": sorted(list(post_tags)),
                     "geometry": line_wgs,
                 }
             )
