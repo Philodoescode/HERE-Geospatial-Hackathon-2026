@@ -548,6 +548,106 @@ def quick_precision_recall(
     }
 
 
+def segmented_precision_recall(
+    generated: gpd.GeoDataFrame,
+    nav: gpd.GeoDataFrame,
+    buffer_m: float = 15.0,
+    segment_len: float = 20.0,
+) -> dict:
+    """
+    Accurate precision & recall using line segmentation + STRtree.
+
+    Unlike quick_precision_recall which matches whole lines (inflating
+    metrics for long lines), this splits all lines into fixed-length
+    segments (~20m) and checks each segment independently. This gives
+    much more accurate coverage percentages while remaining fast via
+    STRtree spatial indexing.
+
+    Parameters
+    ----------
+    generated : GeoDataFrame of generated centerlines
+    nav : GeoDataFrame of Nav Streets reference
+    buffer_m : float — buffer distance in metres
+    segment_len : float — max segment length for splitting (metres)
+    """
+    from shapely import STRtree
+    from shapely.geometry import Point
+
+    gen_proj = _to_metric(generated)
+    nav_proj = _to_metric(nav)
+
+    def _segment_lines(geoms):
+        """Split lines into segments of ~segment_len metres."""
+        segments = []
+        lengths = []
+        for geom in geoms:
+            if geom is None or geom.is_empty:
+                continue
+            line_len = geom.length
+            if line_len <= segment_len:
+                segments.append(geom)
+                lengths.append(line_len)
+                continue
+            # Split by extracting coordinate chunks
+            coords = list(geom.coords)
+            current = [coords[0]]
+            current_len = 0.0
+            for k in range(1, len(coords)):
+                seg_d = Point(coords[k]).distance(Point(coords[k - 1]))
+                current.append(coords[k])
+                current_len += seg_d
+                if current_len >= segment_len:
+                    if len(current) >= 2:
+                        seg = LineString(current)
+                        segments.append(seg)
+                        lengths.append(seg.length)
+                    current = [coords[k]]
+                    current_len = 0.0
+            if len(current) >= 2:
+                seg = LineString(current)
+                if seg.length > 0:
+                    segments.append(seg)
+                    lengths.append(seg.length)
+        return segments, np.array(lengths)
+
+    gen_segs, gen_seg_lens = _segment_lines(gen_proj.geometry.values)
+    nav_segs, nav_seg_lens = _segment_lines(nav_proj.geometry.values)
+
+    gen_total = gen_seg_lens.sum()
+    nav_total = nav_seg_lens.sum()
+
+    if gen_total == 0 or nav_total == 0:
+        return {
+            "nav_recovery_pct": 0.0,
+            "nav_precision_pct": 0.0,
+            "new_road_km": 0.0,
+            "total_length_km": round(gen_total / 1000.0, 3),
+            "num_lines": len(generated),
+        }
+
+    # Precision: % of generated segments near nav
+    nav_tree = STRtree(nav_segs)
+    hit_gen, _ = nav_tree.query(gen_segs, predicate="dwithin", distance=buffer_m)
+    covered_gen_idx = np.unique(hit_gen)
+    precision_length = gen_seg_lens[covered_gen_idx].sum() if len(covered_gen_idx) > 0 else 0.0
+    precision = (precision_length / gen_total * 100) if gen_total > 0 else 0.0
+
+    # Recovery: % of nav segments near generated
+    gen_tree = STRtree(gen_segs)
+    hit_nav, _ = gen_tree.query(nav_segs, predicate="dwithin", distance=buffer_m)
+    covered_nav_idx = np.unique(hit_nav)
+    recovery_length = nav_seg_lens[covered_nav_idx].sum() if len(covered_nav_idx) > 0 else 0.0
+    recovery = (recovery_length / nav_total * 100) if nav_total > 0 else 0.0
+
+    return {
+        "nav_recovery_pct": round(recovery, 2),
+        "nav_precision_pct": round(precision, 2),
+        "new_road_km": round(max(gen_total - precision_length, 0) / 1000.0, 3),
+        "total_length_km": round(gen_total / 1000.0, 3),
+        "num_lines": len(generated),
+    }
+
+
 def print_quick_metrics(d: dict, label: str = "Centerlines") -> None:
     """Pretty-print quick metrics dict."""
     print(f"\n{'=' * 60}")

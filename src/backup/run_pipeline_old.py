@@ -1,15 +1,15 @@
 """
-HSGA Pipeline Runner — Deep-Flow Hybrid Pipeline (5 phases)
+HSGA Pipeline Runner — Runs all 4 phases with metrics after each.
 
 Usage:
     python run_pipeline.py [--sample N] [--skip-phase1]
 
-Phases:
-  1. Data Ingestion (VPD + HPD + Nav Streets)
-  2. KDE Skeletonization (direction-aware rasterization -> morphological skeleton)
-  3. Probe Recovery (Bresenham transition enhancement on HPD residuals)
-  4. Graph Merging (VPD + Probe skeleton dedup & snapping)
-  5. Geometry Optimization (B-spline smoothing, redundancy removal, stub pruning)
+This script:
+  1. Phase 1: Data Ingestion (VPD + HPD + Nav Streets)
+  2. Phase 2: VPD Skeleton Construction (Fréchet bundling)
+  3. Phase 3: Probe-based Gap Filling
+  4. Phase 4: Topology Refinement & Smoothing
+  5. After each phase: evaluate against Nav Streets ground truth
 """
 
 import os
@@ -23,7 +23,7 @@ import geopandas as gpd
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, PROJECT_ROOT)
 
-from src.evaluation.metrics import print_quick_metrics
+from src.evaluation.metrics import quick_precision_recall, print_quick_metrics
 
 
 def load_nav_streets():
@@ -41,7 +41,7 @@ def load_nav_streets():
 
 
 def evaluate_phase(phase_name, output_path, nav_gdf, buffer_m=15.0):
-    """Accurate evaluation using segmented precision/recall."""
+    """Fast evaluation: precision & recall via spatial index (no heavy intersection)."""
     print(f"\n{'─' * 60}")
     print(f"  METRICS: {phase_name}")
     print(f"{'─' * 60}")
@@ -61,9 +61,7 @@ def evaluate_phase(phase_name, output_path, nav_gdf, buffer_m=15.0):
         generated = generated.to_crs("EPSG:4326")
 
     t0 = time.time()
-    # Use segmented P/R: splits lines into ~20m chunks for accurate coverage
-    from src.evaluation.metrics import segmented_precision_recall
-    result = segmented_precision_recall(generated, nav_gdf, buffer_m=buffer_m)
+    result = quick_precision_recall(generated, nav_gdf, buffer_m=buffer_m)
     elapsed = time.time() - t0
     print_quick_metrics(result, label=phase_name)
     print(f"  (evaluated in {elapsed:.1f}s)")
@@ -71,31 +69,15 @@ def evaluate_phase(phase_name, output_path, nav_gdf, buffer_m=15.0):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="HSGA Deep-Flow Pipeline Runner")
-    parser.add_argument("--sample", type=int, default=10000,
-                        help="VPD sample size (default: 10000)")
+    parser = argparse.ArgumentParser(description="HSGA Pipeline Runner")
+    parser.add_argument("--sample", type=int, default=5000,
+                        help="VPD sample size (default: 5000)")
     parser.add_argument("--skip-phase1", action="store_true",
                         help="Skip Phase 1 if outputs exist")
-                        
-    # Phase 2 Parameters
-    parser.add_argument("--cluster-radius-m", type=float, default=10.0)
-    parser.add_argument("--heading-tolerance-deg", type=float, default=55.0)
-    parser.add_argument("--heading-distance-weight-m", type=float, default=0.18)
-    parser.add_argument("--min-edge-support", type=float, default=1.0)
-    parser.add_argument("--reverse-edge-ratio", type=float, default=0.2)
-    parser.add_argument("--sample-spacing-m", type=float, default=8.0)
-    parser.add_argument("--max-points-per-trace", type=int, default=120)
-    parser.add_argument("--candidate-selection-threshold", type=float, default=0.25)
-    parser.add_argument("--candidate-density-scale", type=float, default=0.15)
-    parser.add_argument("--enable-dynamic-weighting", action="store_true", default=True)
-    parser.add_argument("--dyn-lambda-vpd", type=float, default=1.6)
-    parser.add_argument("--dyn-road-likeness-beta", type=float, default=6.0)
-    parser.add_argument("--dyn-road-likeness-tau", type=float, default=0.45)
-    
     args = parser.parse_args()
 
     print("=" * 60)
-    print("  HSGA DEEP-FLOW PIPELINE — Full Execution with Metrics")
+    print("  HSGA PIPELINE — Full Execution with Metrics")
     print("=" * 60)
     print(f"  VPD sample size: {args.sample}")
     print(f"  Project root: {PROJECT_ROOT}")
@@ -124,93 +106,60 @@ def main():
         phase1 = DataIngestionPipeline(vpd_sample_size=args.sample)
         phase1.run()
 
+    # Skip Phase 1 evaluation — raw VPD traces are not centerlines,
+    # so precision/recall is not meaningful and it's very slow (5000 traces).
     m1 = None
     print("\n  Phase 1 metrics: SKIPPED (raw traces, not centerlines yet)")
-    gc.collect()
+    gc.collect()  # Free Phase 1 memory before Phase 2
 
     # ─────────────────────────────────────────────────────────────
-    #  PHASE 2: Kharita Centerline Generation
+    #  PHASE 2: VPD Skeleton Construction
     # ─────────────────────────────────────────────────────────────
     print("\n" + "=" * 60)
     skeleton_output = os.path.join(PROJECT_ROOT, "data", "interim_skeleton_phase2.gpkg")
 
-    from src.pipeline_phase2 import KDESkeletonizer, KharitaConfig  # Now uses Kharita algorithm
-    
-    # Configure Phase 2
-    p2_config = KharitaConfig(
-        cluster_radius_m=args.cluster_radius_m,
-        heading_tolerance_deg=args.heading_tolerance_deg,
-        heading_distance_weight_m=args.heading_distance_weight_m,
-        min_edge_support=args.min_edge_support,
-        reverse_edge_ratio=args.reverse_edge_ratio,
-        sample_spacing_m=args.sample_spacing_m,
-        max_points_per_trace=args.max_points_per_trace,
-        candidate_selection_threshold=args.candidate_selection_threshold,
-        candidate_density_scale=args.candidate_density_scale,
-        enable_dynamic_weighting=args.enable_dynamic_weighting,
-        dyn_lambda_vpd=args.dyn_lambda_vpd,
-        dyn_road_likeness_beta=args.dyn_road_likeness_beta,
-        dyn_road_likeness_tau=args.dyn_road_likeness_tau,
-    )
+    from src.pipeline_phase2 import Skeletonizer
 
-    skeletonizer = KDESkeletonizer(vpd_output, skeleton_output, config=p2_config)
+    skeletonizer = Skeletonizer(vpd_output, skeleton_output)
     skeletonizer.run()
-    del skeletonizer; gc.collect()
+    del skeletonizer; gc.collect()  # Free Phase 2 memory
 
-    m2 = evaluate_phase("Phase 2: Kharita Centerlines", skeleton_output, nav_gdf)
+    m2 = evaluate_phase("Phase 2: VPD Skeleton", skeleton_output, nav_gdf)
 
     # ─────────────────────────────────────────────────────────────
-    #  PHASE 3: Probe Recovery
+    #  PHASE 3: Probe-based Gap Filling
     # ─────────────────────────────────────────────────────────────
     print("\n" + "=" * 60)
-    probe_output = os.path.join(PROJECT_ROOT, "data", "interim_probe_skeleton_phase3.gpkg")
+    network_output = os.path.join(PROJECT_ROOT, "data", "final_network_phase3.gpkg")
 
-    from src.pipeline_phase3 import ProbeRecovery  # Now uses Roadster algorithm
+    from src.pipeline_phase3 import GapFiller
 
-    recovery = ProbeRecovery(
+    filler = GapFiller(
         skeleton_path=skeleton_output,
         hpd_path=hpd_output,
         output_dir=os.path.join(PROJECT_ROOT, "data"),
     )
-    recovery.run()
-    del recovery; gc.collect()
+    filler.run()
 
-    m3 = evaluate_phase("Phase 3: Roadster Probe Recovery", probe_output, nav_gdf)
-
-    # ─────────────────────────────────────────────────────────────
-    #  PHASE 4: Graph Merging
-    # ─────────────────────────────────────────────────────────────
-    print("\n" + "=" * 60)
-    merged_output = os.path.join(PROJECT_ROOT, "data", "merged_network_phase4.gpkg")
-
-    from src.pipeline_phase4 import GraphMerger
-
-    merger = GraphMerger(
-        vpd_skeleton_path=skeleton_output,
-        probe_skeleton_path=probe_output,
-        output_dir=os.path.join(PROJECT_ROOT, "data"),
-    )
-    merger.run()
-    del merger; gc.collect()
-
-    m4 = evaluate_phase("Phase 4: Merged Network", merged_output, nav_gdf)
+    m3 = evaluate_phase("Phase 3: Skeleton + Probes", network_output, nav_gdf)
+    del filler; gc.collect()  # Free Phase 3 memory
 
     # ─────────────────────────────────────────────────────────────
-    #  PHASE 5: Geometry Optimization
+    #  PHASE 4: Topology Refinement
     # ─────────────────────────────────────────────────────────────
     print("\n" + "=" * 60)
     final_output = os.path.join(PROJECT_ROOT, "data", "final_centerline_output_4326.gpkg")
 
-    from src.pipeline_phase5 import GeometryOptimizer
+    from src.pipeline_phase4 import TopologyRefiner
 
-    optimizer = GeometryOptimizer(
-        merged_output,
+    refiner = TopologyRefiner(
+        network_output,
         output_dir=os.path.join(PROJECT_ROOT, "data"),
     )
-    optimizer.run()
-    del optimizer; gc.collect()
+    refiner.run()
 
-    m5 = evaluate_phase("Phase 5: Final Output", final_output, nav_gdf)
+    m4 = evaluate_phase("Phase 4: Final Refined", final_output, nav_gdf)
+    del refiner; gc.collect()  # Free Phase 4 memory
 
     # ─────────────────────────────────────────────────────────────
     #  SUMMARY
@@ -227,10 +176,9 @@ def main():
 
     for label, m in [
         ("Phase 1: Raw VPD", m1),
-        ("Phase 2: Kharita Centerlines", m2),
-        ("Phase 3: Roadster Probe Recovery", m3),
-        ("Phase 4: Merged Network", m4),
-        ("Phase 5: Final Output", m5),
+        ("Phase 2: Skeleton", m2),
+        ("Phase 3: + Probes", m3),
+        ("Phase 4: Refined", m4),
     ]:
         if m is not None:
             print(f"  {label:<35} {m['nav_recovery_pct']:>10.1f} {m['nav_precision_pct']:>10.1f} {m['num_lines']:>8}")

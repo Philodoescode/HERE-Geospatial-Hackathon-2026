@@ -1,331 +1,378 @@
 """
-Phase 4: Topology Refinement & Geometry Smoothing
+Phase 4: Graph Merging — Combine VPD + Probe Skeletons
 
-Key improvements over previous version:
-  FIX 1 - Intersection-based planarization (not unary_union dissolve)
-  FIX 2 - Adaptive smoothing (points proportional to length, not fixed 20)
-  FIX 3 - Conservative stub pruning (10m threshold, checks connectivity)
-  FIX 4 - Proper node snapping with distance threshold
-  FIX 5 - Coordinate precision: 1 decimal in metric CRS (~10cm)
-  FIX 6 - Clean handling of MultiLineStrings via explode
+Merges the high-precision VPD skeleton (Phase 2) with the high-recall
+Probe skeleton (Phase 3) into a single network without degrading precision.
+
+Algorithm:
+  1. Load both skeletons
+  2. Buffer deduplication: remove Probe edges already covered by VPD
+  3. Endpoint snapping via cKDTree + union-find
+  4. Line merge for collinear adjacent segments
+  5. Export combined network
 """
 
-import geopandas as gpd
-import pandas as pd
-import numpy as np
-from shapely.geometry import LineString, Point, MultiLineString
-from shapely.ops import unary_union, linemerge, snap
-import networkx as nx
-from scipy.interpolate import splprep, splev
+import gc
 import os
+import sys
 import time
 import warnings
+from collections import defaultdict
+
+import geopandas as gpd
+import numpy as np
+import pandas as pd
+from scipy.spatial import cKDTree
+from shapely import STRtree
+from shapely.geometry import LineString, MultiLineString, Point
+from shapely.ops import linemerge, nearest_points, snap, unary_union
 
 warnings.filterwarnings("ignore")
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
-class TopologyRefiner:
+class GraphMerger:
     """
-    Phase 4: Refine the network topology.
+    Phase 4: Merge VPD skeleton + Probe skeleton into a unified network.
 
-    Steps:
-      1. Planarize: split lines at mutual intersections
-      2. Smooth: adaptive B-spline (length-proportional point count)
-      3. Prune: remove short dead-end stubs
-      4. Clean: fix invalid geometries, remove empties
-      5. Export in both local CRS and WGS84
+    VPD skeleton is high-precision (kept as-is).
+    Probe skeleton fills gaps but may overlap — deduplication is critical.
     """
 
     def __init__(
         self,
-        input_path,
+        vpd_skeleton_path,
+        probe_skeleton_path,
         output_dir="data",
-        snap_tolerance=1.0,     # FIX 4: node snapping tolerance (metres)
-        stub_threshold=10.0,    # FIX 3: conservative (was 15m)
-        smoothing_factor=3.0,   # FIX 2: B-spline smoothing factor
-        points_per_100m=10,     # FIX 2: adaptive point density
+        dedup_buffer_m=10.0,      # tighter dedup zone to preserve parallel roads (was 18)
+        snap_dist_m=10.0,         # endpoint snapping distance
+        min_length_m=6.0,         # relaxed minimum (was 8)
+        probe_min_length_m=8.0,   # relaxed minimum for probe lines (was 12)
     ):
-        self.input_path = input_path
+        self.vpd_skeleton_path = vpd_skeleton_path
+        self.probe_skeleton_path = probe_skeleton_path
         self.output_dir = output_dir
-        self.snap_tolerance = snap_tolerance
-        self.stub_threshold = stub_threshold
-        self.smoothing_factor = smoothing_factor
-        self.points_per_100m = points_per_100m
+        self.dedup_buffer_m = dedup_buffer_m
+        self.snap_dist_m = snap_dist_m
+        self.min_length_m = min_length_m
+        self.probe_min_length_m = probe_min_length_m
 
-        self.gdf = None
         self.local_crs = None
-        self.final_gdf = None
+        self.vpd_skel = None
+        self.probe_skel = None
+        self.merged_gdf = None
 
     # ──────────────────────────────────────────────────────────────────
     #  DATA LOADING
     # ──────────────────────────────────────────────────────────────────
 
     def load_data(self):
-        print("  Loading network data...")
-        if not os.path.exists(self.input_path):
-            raise FileNotFoundError(f"Input not found: {self.input_path}")
+        print("  Loading VPD and Probe skeletons...")
 
-        self.gdf = gpd.read_file(self.input_path)
-
-        if self.gdf.crs is None or self.gdf.crs.is_geographic:
-            bounds = self.gdf.total_bounds
+        # VPD skeleton
+        self.vpd_skel = gpd.read_file(self.vpd_skeleton_path)
+        if self.vpd_skel.crs is None or self.vpd_skel.crs.is_geographic:
+            bounds = self.vpd_skel.total_bounds
             cx = (bounds[0] + bounds[2]) / 2.0
             cy = (bounds[1] + bounds[3]) / 2.0
             self.local_crs = (
                 f"+proj=aeqd +lat_0={cy} +lon_0={cx} "
                 f"+x_0=0 +y_0=0 +ellps=WGS84 +datum=WGS84 +units=m +no_defs"
             )
-            self.gdf = self.gdf.to_crs(self.local_crs)
+            self.vpd_skel = self.vpd_skel.to_crs(self.local_crs)
         else:
-            self.local_crs = self.gdf.crs
+            self.local_crs = self.vpd_skel.crs
 
-        # FIX 6: Explode MultiLineStrings
-        self.gdf = self.gdf.explode(index_parts=False).reset_index(drop=True)
+        # Filter valid geometries
+        self.vpd_skel = self.vpd_skel[
+            self.vpd_skel.geometry.notna()
+            & ~self.vpd_skel.geometry.is_empty
+        ].reset_index(drop=True)
 
-        # Remove empties and non-linestrings
-        self.gdf = self.gdf[
-            self.gdf.geometry.notna()
-            & ~self.gdf.geometry.is_empty
-            & (self.gdf.geom_type == "LineString")
-        ].copy()
+        print(f"    VPD skeleton: {len(self.vpd_skel)} segments")
 
-        self.gdf = self.gdf.reset_index(drop=True)
-        print(f"    Loaded {len(self.gdf)} line segments")
-
-    # ──────────────────────────────────────────────────────────────────
-    #  PLANARIZATION (FIX 1)
-    # ──────────────────────────────────────────────────────────────────
-
-    def planarize_network(self):
-        """
-        FIX 1: Split lines at intersection points to create a proper
-        planar graph. Uses unary_union which in Shapely 2.x properly
-        nods lines at crossing points.
-        """
-        print("  Planarizing network...")
-        before = len(self.gdf)
-
-        # unary_union of all lines creates properly noded geometry
-        all_lines = self.gdf.geometry.tolist()
-        merged = unary_union(all_lines)
-
-        # Extract individual linestrings
-        if merged.geom_type == "MultiLineString":
-            planar_lines = list(merged.geoms)
-        elif merged.geom_type == "LineString":
-            planar_lines = [merged]
-        elif hasattr(merged, "geoms"):
-            planar_lines = [g for g in merged.geoms if isinstance(g, LineString)]
+        # Probe skeleton
+        if os.path.exists(self.probe_skeleton_path):
+            self.probe_skel = gpd.read_file(self.probe_skeleton_path)
+            if len(self.probe_skel) > 0:
+                self.probe_skel = self.probe_skel.to_crs(self.local_crs)
+                self.probe_skel = self.probe_skel[
+                    self.probe_skel.geometry.notna()
+                    & ~self.probe_skel.geometry.is_empty
+                ].reset_index(drop=True)
+            print(f"    Probe skeleton: {len(self.probe_skel)} segments")
         else:
-            planar_lines = [merged]
-
-        # Remove very short artifacts from planarization
-        planar_lines = [l for l in planar_lines if l.length > 0.5]
-
-        self.gdf = gpd.GeoDataFrame(geometry=planar_lines, crs=self.local_crs)
-        print(f"    Planarized: {before} → {len(self.gdf)} segments")
+            print(f"    Probe skeleton not found at {self.probe_skeleton_path}")
+            self.probe_skel = gpd.GeoDataFrame(columns=["geometry"], crs=self.local_crs)
 
     # ──────────────────────────────────────────────────────────────────
-    #  SMOOTHING (FIX 2)
+    #  BUFFER DEDUPLICATION
     # ──────────────────────────────────────────────────────────────────
 
-    def smooth_geometry(self):
+    def deduplicate_probes(self):
         """
-        FIX 2: Adaptive B-spline smoothing with length-proportional
-        output point count (not fixed 20 points per segment).
+        Remove probe segments that fall entirely within the VPD buffer.
+        A probe segment is kept only if a significant portion lies
+        outside the VPD coverage zone.
         """
-        print("  Smoothing geometry (adaptive B-splines)...")
-        smoothed_geoms = []
-        smooth_count = 0
-        skip_count = 0
+        if len(self.probe_skel) == 0:
+            print("  No probe segments to deduplicate.")
+            return
 
-        for geom in self.gdf.geometry:
-            if not isinstance(geom, LineString):
-                smoothed_geoms.append(geom)
-                skip_count += 1
-                continue
+        print(f"  Deduplicating probes (removing within {self.dedup_buffer_m}m of VPD)...")
+        before = len(self.probe_skel)
 
-            n_coords = len(geom.coords)
-            if n_coords < 4:
-                # Need at least 4 points for cubic spline
-                smoothed_geoms.append(geom)
-                skip_count += 1
-                continue
+        # Build VPD buffer
+        vpd_buffered = self.vpd_skel.geometry.buffer(self.dedup_buffer_m)
+        vpd_buf_union = unary_union(vpd_buffered.values)
 
+        # For each probe segment, compute what fraction lies within VPD buffer
+        keep_mask = []
+        for geom in self.probe_skel.geometry:
             try:
-                x, y = geom.xy
-                x = list(x)
-                y = list(y)
-
-                # FIX 2: Adaptive output points based on length
-                n_out = max(4, int(geom.length / 100.0 * self.points_per_100m))
-                n_out = min(n_out, 100)  # cap at 100 points
-
-                # Determine spline degree (k): must be < n_coords
-                k = min(3, n_coords - 1)
-
-                tck, u = splprep([x, y], s=self.smoothing_factor, k=k)
-                new_points = splev(np.linspace(0, 1, n_out), tck)
-
-                new_line = LineString(zip(new_points[0], new_points[1]))
-
-                # Sanity check: smoothed line shouldn't deviate too far
-                # from original
-                if new_line.hausdorff_distance(geom) < 5.0:
-                    smoothed_geoms.append(new_line)
-                    smooth_count += 1
-                else:
-                    smoothed_geoms.append(geom)
-                    skip_count += 1
+                inside = geom.intersection(vpd_buf_union)
+                frac_inside = inside.length / geom.length if geom.length > 0 else 1.0
+                # Keep if >40% is outside the VPD buffer (relaxed from 50%)
+                # AND the segment is long enough to be a real road
+                keep = (frac_inside < 0.6) and (geom.length >= self.probe_min_length_m)
+                keep_mask.append(keep)
             except Exception:
-                smoothed_geoms.append(geom)
-                skip_count += 1
+                keep_mask.append(False)  # on error, discard probe (conservative)
 
-        self.gdf["geometry"] = smoothed_geoms
-        print(f"    Smoothed: {smooth_count} lines, skipped: {skip_count}")
+        self.probe_skel = self.probe_skel[keep_mask].reset_index(drop=True)
+        removed = before - len(self.probe_skel)
+        print(f"    Dedup: {before} -> {len(self.probe_skel)} probe segments "
+              f"({removed} removed as VPD-covered)")
+
+        del vpd_buf_union, vpd_buffered
+        gc.collect()
 
     # ──────────────────────────────────────────────────────────────────
-    #  STUB PRUNING (FIX 3)
+    #  ENDPOINT SNAPPING
     # ──────────────────────────────────────────────────────────────────
 
-    def prune_stubs(self):
+    def snap_endpoints(self, lines):
         """
-        FIX 3: Conservative stub pruning.
-        Only removes dead-end segments shorter than threshold.
-        Iterates until no more stubs are found.
+        Snap nearby endpoints together using cKDTree + union-find.
+        This ensures connectivity at junctions.
+        
+        Returns list of same length as input - invalid geometries become None.
         """
-        print(f"  Pruning stubs (< {self.stub_threshold}m dead-ends)...")
+        if len(lines) < 2:
+            return lines
 
-        # FIX 5: Coordinate rounding for node matching (1 decimal = ~10cm)
-        def round_coord(c):
-            return (round(c[0], 1), round(c[1], 1))
+        print(f"  Snapping endpoints (within {self.snap_dist_m}m)...")
 
-        total_removed = 0
-        iteration = 0
-        max_iterations = 5
+        # Collect all endpoints
+        all_ends = []
+        for line in lines:
+            cs = list(line.coords)
+            all_ends.append(cs[0])
+            all_ends.append(cs[-1])
 
-        while iteration < max_iterations:
-            iteration += 1
+        coords_arr = np.array(all_ends, dtype=np.float64)
+        kd = cKDTree(coords_arr)
+        pairs = kd.query_pairs(self.snap_dist_m)
 
-            # Build graph from endpoints
-            G = nx.Graph()
-            edge_data = {}
+        if not pairs:
+            print("    No endpoints to snap.")
+            return lines
 
-            for idx, row in self.gdf.iterrows():
-                geom = row.geometry
-                if not isinstance(geom, LineString) or len(geom.coords) < 2:
-                    continue
+        # Union-find
+        parent = list(range(len(all_ends)))
 
-                u = round_coord(geom.coords[0])
-                v = round_coord(geom.coords[-1])
+        def find(i):
+            while parent[i] != i:
+                parent[i] = parent[parent[i]]
+                i = parent[i]
+            return i
 
-                if u == v:
-                    # Self-loop: skip (roundabout artifact)
-                    continue
+        for a, b in pairs:
+            ra, rb = find(a), find(b)
+            if ra != rb:
+                parent[ra] = rb
 
-                G.add_edge(u, v, idx=idx, length=geom.length)
-                edge_data[(u, v)] = idx
+        clusters = defaultdict(list)
+        for i in range(len(all_ends)):
+            clusters[find(i)].append(i)
 
-            # Find degree-1 nodes (dead ends) with short edges
-            stubs_to_remove = set()
+        snap_map = {}
+        for members in clusters.values():
+            if len(members) < 2:
+                continue
+            cx = np.mean([coords_arr[m][0] for m in members])
+            cy = np.mean([coords_arr[m][1] for m in members])
+            for m in members:
+                snap_map[m] = (cx, cy)
 
-            for node in G.nodes():
-                if G.degree(node) == 1:
-                    neighbor = list(G.neighbors(node))[0]
-                    data = G[node][neighbor]
-                    if data.get("length", float("inf")) < self.stub_threshold:
-                        stubs_to_remove.add(data["idx"])
+        # Return same length as input - None for invalid geometries
+        snapped = []
+        for li, line in enumerate(lines):
+            coords = list(line.coords)
+            si, ei = li * 2, li * 2 + 1
+            if si in snap_map:
+                coords[0] = snap_map[si]
+            if ei in snap_map:
+                coords[-1] = snap_map[ei]
+            new_line = LineString(coords)
+            if not new_line.is_empty and new_line.length > 0:
+                snapped.append(new_line)
+            else:
+                snapped.append(None)  # Preserve index alignment
 
-            if not stubs_to_remove:
-                break
-
-            self.gdf = self.gdf.drop(index=list(stubs_to_remove)).reset_index(drop=True)
-            total_removed += len(stubs_to_remove)
-
-        print(f"    Removed {total_removed} stubs over {iteration} iteration(s)")
-        print(f"    Network: {len(self.gdf)} segments remaining")
+        n_snapped = len(snap_map)
+        print(f"    Snapped {n_snapped} endpoints across {len(clusters)} groups")
+        return snapped
 
     # ──────────────────────────────────────────────────────────────────
-    #  CLEANING
+    #  MERGE + CLEAN
     # ──────────────────────────────────────────────────────────────────
 
-    def clean_geometries(self):
-        """Fix invalid geometries and remove empty/point results."""
-        print("  Cleaning geometries...")
-        before = len(self.gdf)
+    def merge_networks(self):
+        """
+        Combine VPD + deduplicated Probe segments while preserving attributes.
+        
+        Unlike the old version, we do NOT use linemerge (which destroys attributes).
+        Instead, we concatenate GeoDataFrames and preserve support data.
+        """
+        print("  Merging VPD + Probe networks (attribute-preserving)...")
 
-        self.gdf = self.gdf[~self.gdf.geometry.is_empty].copy()
+        # Prepare VPD with default high support
+        vpd_records = []
+        for idx, row in self.vpd_skel.iterrows():
+            geom = row.geometry
+            geoms_to_add = []
+            if isinstance(geom, MultiLineString):
+                geoms_to_add = list(geom.geoms)
+            elif isinstance(geom, LineString):
+                geoms_to_add = [geom]
+            
+            for g in geoms_to_add:
+                vpd_records.append({
+                    "geometry": g,
+                    "source": "VPD",
+                    "weighted_support": 50.0,  # VPD segments get high default support
+                    "heading_consistency": 0.9,
+                    "cluster_members": 10,
+                })
+        
+        # Prepare Probe with support from Phase 3 output
+        probe_records = []
+        for idx, row in self.probe_skel.iterrows():
+            geom = row.geometry
+            geoms_to_add = []
+            if isinstance(geom, MultiLineString):
+                geoms_to_add = list(geom.geoms)
+            elif isinstance(geom, LineString):
+                geoms_to_add = [geom]
+            
+            # Get support data if available (from Phase 3)
+            weighted_support = row.get("weighted_support", 3.0) if hasattr(row, "get") else getattr(row, "weighted_support", 3.0)
+            heading_consistency = row.get("heading_consistency", 0.5) if hasattr(row, "get") else getattr(row, "heading_consistency", 0.5)
+            cluster_members = row.get("cluster_members", 2) if hasattr(row, "get") else getattr(row, "cluster_members", 2)
+            
+            for g in geoms_to_add:
+                probe_records.append({
+                    "geometry": g,
+                    "source": "Probe",
+                    "weighted_support": float(weighted_support) if weighted_support is not None else 3.0,
+                    "heading_consistency": float(heading_consistency) if heading_consistency is not None else 0.5,
+                    "cluster_members": int(cluster_members) if cluster_members is not None else 2,
+                })
+        
+        print(f"    Combined: {len(vpd_records)} VPD + {len(probe_records)} Probe = {len(vpd_records) + len(probe_records)} total")
 
-        # Fix invalid
-        invalid_mask = ~self.gdf.geometry.is_valid
-        if invalid_mask.sum() > 0:
-            self.gdf.loc[invalid_mask, "geometry"] = (
-                self.gdf.loc[invalid_mask, "geometry"].buffer(0)
+        # Create combined GeoDataFrame
+        all_records = vpd_records + probe_records
+        if not all_records:
+            self.merged_gdf = gpd.GeoDataFrame(
+                columns=["geometry", "source", "weighted_support", "heading_consistency", "cluster_members"],
+                crs=self.local_crs
             )
+            return self.merged_gdf
+        
+        combined_gdf = gpd.GeoDataFrame(all_records, crs=self.local_crs)
+        
+        # Filter short segments (different thresholds for VPD vs Probe)
+        keep_mask = []
+        for idx, row in combined_gdf.iterrows():
+            if row["source"] == "VPD":
+                keep_mask.append(row.geometry.length >= self.min_length_m)
+            else:
+                keep_mask.append(row.geometry.length >= self.probe_min_length_m)
+        
+        combined_gdf = combined_gdf[keep_mask].reset_index(drop=True)
+        print(f"    After length filter: {len(combined_gdf)} segments")
 
-        # Keep only LineStrings
-        self.gdf = self.gdf[
-            self.gdf.geom_type.isin(["LineString", "MultiLineString"])
-        ].copy()
+        # Snap endpoints - need to preserve attribute alignment
+        # First snap all geometries
+        original_geoms = list(combined_gdf.geometry)
+        snapped_geoms = self.snap_endpoints(original_geoms)
+        
+        # Build new records keeping only valid snapped geometries
+        valid_records = []
+        for i, geom in enumerate(snapped_geoms):
+            if geom is not None and not geom.is_empty and geom.length > 0:
+                row = combined_gdf.iloc[i].to_dict()
+                row["geometry"] = geom
+                valid_records.append(row)
+        
+        if valid_records:
+            combined_gdf = gpd.GeoDataFrame(valid_records, crs=self.local_crs)
+        else:
+            combined_gdf = gpd.GeoDataFrame(
+                columns=["geometry", "source", "weighted_support", "heading_consistency", "cluster_members"],
+                crs=self.local_crs
+            )
+        
+        print(f"    After snapping: {len(combined_gdf)} segments")
+        
+        # Log support stats
+        probe_mask = combined_gdf["source"] == "Probe"
+        if probe_mask.any():
+            probe_support = combined_gdf.loc[probe_mask, "weighted_support"]
+            print(f"    Probe support stats: min={probe_support.min():.1f}, "
+                  f"max={probe_support.max():.1f}, mean={probe_support.mean():.1f}")
 
-        # Remove very short segments (< 1m)
-        self.gdf = self.gdf[self.gdf.geometry.length >= 1.0].copy()
-        self.gdf = self.gdf.reset_index(drop=True)
-
-        after = len(self.gdf)
-        print(f"    Cleaned: {before} → {after} segments")
+        self.merged_gdf = combined_gdf
+        return self.merged_gdf
 
     # ──────────────────────────────────────────────────────────────────
-    #  EXPORT
-    # ──────────────────────────────────────────────────────────────────
-
-    def export(self):
-        self.clean_geometries()
-
-        self.final_gdf = self.gdf.copy()
-
-        output_path = os.path.join(self.output_dir, "final_centerline_output.gpkg")
-        print(f"  Exporting to {output_path}...")
-
-        # Save in local CRS
-        self.final_gdf.to_file(output_path, driver="GPKG")
-
-        # Also save as WGS84
-        output_4326 = output_path.replace(".gpkg", "_4326.gpkg")
-        gdf_4326 = self.final_gdf.to_crs("EPSG:4326")
-        gdf_4326.to_file(output_4326, driver="GPKG")
-        print(f"  Exported: {len(self.final_gdf)} segments")
-        print(f"    Local CRS: {output_path}")
-        print(f"    WGS84:     {output_4326}")
-
-    # ──────────────────────────────────────────────────────────────────
-    #  MAIN PIPELINE
+    #  EXPORT / MAIN PIPELINE
     # ──────────────────────────────────────────────────────────────────
 
     def run(self):
         print("=" * 60)
-        print("  PHASE 4: Topology Refinement & Smoothing")
+        print("  PHASE 4: Graph Merging (VPD + Probe)")
         print("=" * 60)
         t0 = time.time()
 
         self.load_data()
-        # Skip planarization — unary_union explodes segment count
-        # (e.g. 6k → 365k fragments). Instead just smooth and prune.
-        self.smooth_geometry()
-        self.prune_stubs()
-        self.export()
+        self.deduplicate_probes()
+        self.merge_networks()
+
+        # Export
+        output_path = os.path.join(self.output_dir, "merged_network_phase4.gpkg")
+        print(f"  Exporting to {output_path}...")
+        out_gdf = self.merged_gdf.to_crs("EPSG:4326")
+        out_gdf.to_file(output_path, driver="GPKG")
 
         elapsed = time.time() - t0
-        total_km = self.final_gdf.geometry.length.sum() / 1000.0
-        print(f"\nPhase 4 complete in {elapsed:.1f}s")
-        print(f"  Final network: {len(self.final_gdf)} segments, {total_km:.1f} km")
+        total_km = self.merged_gdf.geometry.length.sum() / 1000.0
+        n_vpd = (self.merged_gdf["source"] == "VPD").sum()
+        n_probe = (self.merged_gdf["source"] == "Probe").sum()
 
-        return self.final_gdf
+        print(f"\nPhase 4 complete in {elapsed:.1f}s")
+        print(f"  Merged network: {len(self.merged_gdf)} segments ({total_km:.1f} km)")
+        print(f"    VPD: {n_vpd}, Probe: {n_probe}")
+
+        return self.merged_gdf
 
 
 if __name__ == "__main__":
-    INPUT_FILE = os.path.join(PROJECT_ROOT, "data", "final_network_phase3.gpkg")
-    refiner = TopologyRefiner(INPUT_FILE)
-    refiner.run()
+    VPD_SKEL = os.path.join(PROJECT_ROOT, "data", "interim_skeleton_phase2.gpkg")
+    PROBE_SKEL = os.path.join(PROJECT_ROOT, "data", "interim_probe_skeleton_phase3.gpkg")
+
+    merger = GraphMerger(VPD_SKEL, PROBE_SKEL)
+    merger.run()

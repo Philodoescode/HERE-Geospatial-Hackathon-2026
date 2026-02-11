@@ -14,8 +14,8 @@ DATA_DIR = PROJECT_ROOT / "data"
 VPD_CSV = DATA_DIR / "Kosovo_VPD" / "Kosovo_VPD.csv"
 HPD_WEEK_1_CSV = DATA_DIR / "Kosovo_HPD" / "XKO_HPD_week_1.csv"
 HPD_WEEK_2_CSV = DATA_DIR / "Kosovo_HPD" / "XKO_HPD_week_2.csv"
-NAV_STREETS_GPKG = DATA_DIR / "Kosovo_s_nav_streets" / "Kosovo.gpkg"
-NAV_STREETS_CSV = DATA_DIR / "Kosovo_s_nav_streets" / "Kosovo.csv"
+NAV_STREETS_GPKG = DATA_DIR / "Kosovo_nav_streets" / "nav_kosovo.gpkg"
+NAV_STREETS_CSV = DATA_DIR / "Kosovo_nav_streets" / "nav_kosovo.csv"
 
 # ── Output Paths ──────────────────────────────────────────────────────────────
 OUTPUTS_DIR = PROJECT_ROOT / "outputs"

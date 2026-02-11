@@ -187,7 +187,7 @@ class DataIngestionPipeline:
             trace_avg_speed = df.groupby("traceid")["speed"].mean()
             fast_traces = trace_avg_speed[trace_avg_speed >= 5.0].index
             df = df[df["traceid"].isin(fast_traces)]
-            print(f"    Speed filter: {before} → {len(df)} points (removed traces avg < 5 km/h)")
+            print(f"    Speed filter: {before} -> {len(df)} points (removed traces avg < 5 km/h)")
 
         # Reconstruct traces
         traces = []
