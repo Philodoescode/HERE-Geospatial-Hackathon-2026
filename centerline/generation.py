@@ -247,6 +247,14 @@ def save_centerline_outputs(
                 )
         return out
 
+    def write_parquet_with_wkt(df: pd.DataFrame, path: Path) -> str:
+        out = df.copy()
+        if "geometry" in out.columns:
+            out["geometry_wkt"] = out["geometry"].astype(str)
+            out = out.drop(columns=["geometry"])
+        out.to_parquet(path, index=False)
+        return str(path)
+
     if not nodes.empty:
         nodes["geometry"] = gpd.points_from_xy(
             nodes["lon"], nodes["lat"], crs="EPSG:4326"
@@ -255,6 +263,8 @@ def save_centerline_outputs(
         node_path = output_dir / f"{stem}_nodes.gpkg"
         gnodes.to_file(node_path, layer="nodes", driver="GPKG")
         files["nodes"] = str(node_path)
+        node_parquet_path = output_dir / f"{stem}_nodes.parquet"
+        files["nodes_parquet"] = write_parquet_with_wkt(nodes, node_parquet_path)
 
     if not edges.empty:
         edges_write = serialize_object_columns(edges)
@@ -262,6 +272,8 @@ def save_centerline_outputs(
         edge_path = output_dir / f"{stem}_edges.gpkg"
         gedges.to_file(edge_path, layer="edges", driver="GPKG")
         files["edges"] = str(edge_path)
+        edge_parquet_path = output_dir / f"{stem}_edges.parquet"
+        files["edges_parquet"] = write_parquet_with_wkt(edges_write, edge_parquet_path)
 
     if not centerlines.empty:
         center_write = serialize_object_columns(centerlines)
@@ -276,6 +288,10 @@ def save_centerline_outputs(
         out_csv = out_csv.drop(columns=["geometry"])
         out_csv.to_csv(csv_path, index=False)
         files["centerlines_csv"] = str(csv_path)
+
+        parquet_path = output_dir / f"{stem}.parquet"
+        out_csv.to_parquet(parquet_path, index=False)
+        files["centerlines_parquet"] = str(parquet_path)
 
     summary_path = output_dir / f"{stem}_summary.json"
     pd.Series(

@@ -7,11 +7,12 @@ This is the original algorithm extracted from the monolithic
 2. Heading-aware incremental clustering (Kharita-style)
 3. Directed co-occurrence graph construction
 4. Three-pass edge pruning (support, direction-conflict, transitive)
-5. Centerline stitching and Chaikin smoothing
+5. Centerline stitching, heuristic candidate selection, and turn-preserving smoothing
 """
 
 from __future__ import annotations
 
+import argparse
 import math
 from collections import Counter, defaultdict
 from dataclasses import dataclass, fields
@@ -27,10 +28,9 @@ from shapely.ops import transform
 from .base import AlgorithmConfig, BaseCenterlineAlgorithm
 from ..utils import (
     angle_diff_deg,
-    bearing_from_xy,
-    chaikin,
     interpolate_altitudes,
     sample_line_projected,
+    smooth_polyline_preserve_turns,
     shortest_alternative_with_hop_limit,
     stitch_centerline_paths,
 )
@@ -57,9 +57,26 @@ class KharitaConfig(AlgorithmConfig):
     # Edge pruning
     min_edge_support: float = 2.0
     reverse_edge_ratio: float = 0.2
+    enable_transitive_pruning: bool = True
     transitive_max_hops: int = 4
     transitive_ratio: float = 1.03
     transitive_max_checks: int = 25000
+
+    # Smoothing
+    use_turn_preserving_smoothing: bool = True
+    turn_smoothing_deg: float = 30.0
+    turn_smoothing_neighbor_weight: float = 0.25
+
+    # Candidate selection (Problem 1 heuristic filtering)
+    apply_candidate_selection: bool = True
+    candidate_selection_threshold: float = 0.52
+    candidate_length_scale_m: float = 70.0
+    candidate_density_scale: float = 0.25
+    candidate_force_keep_weighted_support: float = 18.0
+    candidate_short_length_m: float = 10.0
+    candidate_low_weighted_support: float = 5.0
+    candidate_dangling_max_length_m: float = 35.0
+    candidate_dangling_min_weighted_support: float = 8.0
 
 
 # ---------------------------------------------------------------------------
@@ -228,6 +245,94 @@ def _kharita_style_incremental_clustering(
     return labels, pd.DataFrame(rows)
 
 
+def _candidate_selection(centerlines: pd.DataFrame, config: KharitaConfig) -> pd.DataFrame:
+    out = centerlines.copy()
+    if out.empty:
+        out["is_selected"] = pd.Series(dtype=bool)
+        out["selection_score"] = pd.Series(dtype=np.float64)
+        out["selection_reason"] = pd.Series(dtype=object)
+        return out
+
+    u = pd.to_numeric(out.get("u", -1), errors="coerce").fillna(-1).astype(int)
+    v = pd.to_numeric(out.get("v", -1), errors="coerce").fillna(-1).astype(int)
+    deg = Counter()
+    for uu, vv in zip(u.tolist(), v.tolist()):
+        if uu >= 0:
+            deg[uu] += 1
+        if vv >= 0:
+            deg[vv] += 1
+    u_deg = np.asarray([float(deg.get(int(uu), 0)) for uu in u], dtype=np.float64)
+    v_deg = np.asarray([float(deg.get(int(vv), 0)) for vv in v], dtype=np.float64)
+    dangling = ((u_deg <= 1.0) | (v_deg <= 1.0)).astype(np.float64)
+
+    length_m = pd.to_numeric(out.get("length_m", 0.0), errors="coerce").fillna(0.0).to_numpy(dtype=np.float64)
+    endpoint_dist_m = pd.to_numeric(out.get("endpoint_dist_m", 0.0), errors="coerce").fillna(0.0).to_numpy(dtype=np.float64)
+    weighted_support = pd.to_numeric(out.get("weighted_support", 0.0), errors="coerce").fillna(0.0).to_numpy(dtype=np.float64)
+
+    safe_len = np.maximum(length_m, 1e-6)
+    sinuosity = length_m / np.maximum(endpoint_dist_m, 1e-6)
+    curvature_proxy = np.clip((length_m - endpoint_dist_m) / safe_len, 0.0, 1.0)
+    support_density = weighted_support / safe_len
+
+    support_n = np.clip(weighted_support / max(config.candidate_force_keep_weighted_support, 1e-6), 0.0, 1.0)
+    density_n = np.clip(support_density / max(config.candidate_density_scale, 1e-6), 0.0, 1.0)
+    length_n = np.clip(length_m / max(config.candidate_length_scale_m, 1e-6), 0.0, 1.0)
+    connectivity_n = np.clip((u_deg + v_deg) / 8.0, 0.0, 1.0)
+    connectivity_n = np.where(dangling > 0.0, connectivity_n * 0.35, np.maximum(connectivity_n, 0.65))
+    straight_like = np.clip(1.0 - np.abs(sinuosity - 1.15) / 1.6, 0.0, 1.0)
+    curve_like = np.clip(curvature_proxy / 0.20, 0.0, 1.0)
+    geom_n = np.maximum(0.6 * straight_like + 0.4 * curve_like, curve_like)
+
+    score = (
+        0.30 * support_n
+        + 0.22 * density_n
+        + 0.18 * length_n
+        + 0.20 * connectivity_n
+        + 0.10 * geom_n
+    )
+
+    selected = np.ones(len(out), dtype=bool)
+    reasons: List[str] = []
+    for i in range(len(out)):
+        reason = "score_threshold"
+        if weighted_support[i] >= config.candidate_force_keep_weighted_support:
+            reason = "force_keep_support"
+            selected[i] = True
+        elif (
+            length_m[i] < config.candidate_short_length_m
+            and weighted_support[i] < config.candidate_low_weighted_support
+        ):
+            reason = "drop_short_low_support"
+            selected[i] = False
+        elif (
+            dangling[i] > 0.0
+            and length_m[i] < config.candidate_dangling_max_length_m
+            and weighted_support[i] < config.candidate_dangling_min_weighted_support
+        ):
+            reason = "drop_dangling_weak"
+            selected[i] = False
+        else:
+            selected[i] = bool(score[i] >= config.candidate_selection_threshold)
+            if not selected[i]:
+                reason = "drop_low_score"
+        reasons.append(reason)
+
+    if not config.apply_candidate_selection:
+        selected = np.ones(len(out), dtype=bool)
+        reasons = ["selection_disabled"] * len(out)
+
+    out["u_degree"] = u_deg
+    out["v_degree"] = v_deg
+    out["dangling_flag"] = dangling
+    out["support_density"] = support_density
+    out["sinuosity"] = sinuosity
+    out["curvature_proxy"] = curvature_proxy
+    out["is_selected"] = selected
+    out["selection_score"] = score
+    out["selection_reason"] = reasons
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Algorithm class
 # ---------------------------------------------------------------------------
@@ -244,7 +349,8 @@ class KharitaAlgorithm(BaseCenterlineAlgorithm):
     name = "kharita"
     description = (
         "Kharita-inspired heading-aware clustering with co-occurrence graph "
-        "construction, three-pass edge pruning, and Chaikin smoothing."
+        "construction, three-pass edge pruning, heuristic candidate "
+        "selection, and turn-preserving smoothing."
     )
 
     def __init__(self, config: KharitaConfig | None = None) -> None:
@@ -256,10 +362,43 @@ class KharitaAlgorithm(BaseCenterlineAlgorithm):
         g = parser.add_argument_group("Kharita algorithm parameters")
         g.add_argument("--cluster-radius-m", type=float, default=10.0)
         g.add_argument("--heading-tolerance-deg", type=float, default=45.0)
+        g.add_argument("--heading-distance-weight-m", type=float, default=0.22)
+        g.add_argument("--min-cluster-points", type=int, default=1)
         g.add_argument("--sample-spacing-m", type=float, default=8.0)
         g.add_argument("--max-points-per-trace", type=int, default=120)
+        g.add_argument("--vpd-base-weight", type=float, default=1.2)
+        g.add_argument("--hpd-base-weight", type=float, default=1.0)
         g.add_argument("--max-transition-distance-m", type=float, default=50.0)
         g.add_argument("--min-edge-support", type=float, default=2.0)
+        g.add_argument("--reverse-edge-ratio", type=float, default=0.2)
+        g.add_argument(
+            "--enable-transitive-pruning",
+            action=argparse.BooleanOptionalAction,
+            default=True,
+        )
+        g.add_argument("--transitive-max-hops", type=int, default=4)
+        g.add_argument("--transitive-ratio", type=float, default=1.03)
+        g.add_argument("--transitive-max-checks", type=int, default=25000)
+        g.add_argument(
+            "--use-turn-preserving-smoothing",
+            action=argparse.BooleanOptionalAction,
+            default=True,
+        )
+        g.add_argument("--turn-smoothing-deg", type=float, default=30.0)
+        g.add_argument("--turn-smoothing-neighbor-weight", type=float, default=0.25)
+        g.add_argument(
+            "--apply-candidate-selection",
+            action=argparse.BooleanOptionalAction,
+            default=True,
+        )
+        g.add_argument("--candidate-selection-threshold", type=float, default=0.52)
+        g.add_argument("--candidate-length-scale-m", type=float, default=70.0)
+        g.add_argument("--candidate-density-scale", type=float, default=0.25)
+        g.add_argument("--candidate-force-keep-weighted-support", type=float, default=18.0)
+        g.add_argument("--candidate-short-length-m", type=float, default=10.0)
+        g.add_argument("--candidate-low-weighted-support", type=float, default=5.0)
+        g.add_argument("--candidate-dangling-max-length-m", type=float, default=35.0)
+        g.add_argument("--candidate-dangling-min-weighted-support", type=float, default=8.0)
         g.add_argument("--min-centerline-length-m", type=float, default=12.0)
         g.add_argument("--smooth-iterations", type=int, default=2)
 
@@ -487,31 +626,32 @@ class KharitaAlgorithm(BaseCenterlineAlgorithm):
         for (u, v), dist in edge_lengths.items():
             graph[u].append((v, dist))
 
-        candidates = sorted(
-            edge_support.keys(),
-            key=lambda e: (edge_support[e]["support"], -edge_lengths[e]),
-        )[: config.transitive_max_checks]
+        if config.enable_transitive_pruning and config.transitive_max_checks > 0:
+            candidates = sorted(
+                edge_support.keys(),
+                key=lambda e: (edge_support[e]["support"], -edge_lengths[e]),
+            )[: config.transitive_max_checks]
 
-        dropped_transitive = set()
-        for e in candidates:
-            if e not in edge_support:
-                continue
-            direct = edge_lengths[e]
-            if direct <= 1.0:
-                continue
-            alt = shortest_alternative_with_hop_limit(
-                graph=graph,
-                source=e[0],
-                target=e[1],
-                skip_edge=e,
-                max_hops=config.transitive_max_hops,
-                max_dist=direct * config.transitive_ratio,
-            )
-            if np.isfinite(alt) and alt <= direct * config.transitive_ratio:
-                dropped_transitive.add(e)
+            dropped_transitive = set()
+            for e in candidates:
+                if e not in edge_support:
+                    continue
+                direct = edge_lengths[e]
+                if direct <= 1.0:
+                    continue
+                alt = shortest_alternative_with_hop_limit(
+                    graph=graph,
+                    source=e[0],
+                    target=e[1],
+                    skip_edge=e,
+                    max_hops=config.transitive_max_hops,
+                    max_dist=direct * config.transitive_ratio,
+                )
+                if np.isfinite(alt) and alt <= direct * config.transitive_ratio:
+                    dropped_transitive.add(e)
 
-        for e in dropped_transitive:
-            edge_support.pop(e, None)
+            for e in dropped_transitive:
+                edge_support.pop(e, None)
 
         # -- Output nodes (WGS84) ------------------------------------------
         if nodes.empty:
@@ -582,12 +722,25 @@ class KharitaAlgorithm(BaseCenterlineAlgorithm):
             if len(path_nodes) < 2:
                 continue
             raw_xy = np.asarray([node_xy[n] for n in path_nodes], dtype=np.float64)
-            smooth_xy = chaikin(raw_xy, iterations=config.smooth_iterations)
+            smooth_xy = raw_xy
+            if config.use_turn_preserving_smoothing:
+                smooth_xy = smooth_polyline_preserve_turns(
+                    raw_xy,
+                    passes=max(int(config.smooth_iterations), 0),
+                    turn_deg=float(config.turn_smoothing_deg),
+                    neighbor_weight=float(config.turn_smoothing_neighbor_weight),
+                )
 
             line_xy = LineString([(float(x), float(y)) for x, y in smooth_xy])
             if line_xy.length < config.min_centerline_length_m:
                 continue
             line_wgs = transform(to_wgs.transform, line_xy)
+            endpoint_dist_m = float(
+                np.hypot(
+                    smooth_xy[-1, 0] - smooth_xy[0, 0],
+                    smooth_xy[-1, 1] - smooth_xy[0, 1],
+                )
+            )
 
             fw = 0.0
             rv = 0.0
@@ -657,11 +810,19 @@ class KharitaAlgorithm(BaseCenterlineAlgorithm):
                     if hour_counter
                     else None,
                     "dir_travel": dir_travel,
+                    "u": int(path_nodes[0]),
+                    "v": int(path_nodes[-1]),
+                    "length_m": float(line_xy.length),
+                    "endpoint_dist_m": endpoint_dist_m,
                     "geometry": line_wgs,
                 }
             )
 
         centerlines_df = pd.DataFrame(centerline_rows)
+        centerlines_df = _candidate_selection(centerlines_df, config=config)
+        if config.apply_candidate_selection and not centerlines_df.empty:
+            centerlines_df = centerlines_df[centerlines_df["is_selected"]].copy()
+            centerlines_df = centerlines_df.reset_index(drop=True)
 
         return {
             "projected_crs": projected_crs,

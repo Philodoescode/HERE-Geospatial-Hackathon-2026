@@ -137,6 +137,60 @@ def chaikin(coords: np.ndarray, iterations: int) -> np.ndarray:
     return out
 
 
+def turn_indices(coords: np.ndarray, turn_deg: float) -> set[int]:
+    """Return vertex indices where local heading change exceeds ``turn_deg``."""
+    keep: set[int] = set()
+    if len(coords) == 0:
+        return keep
+    keep.add(0)
+    keep.add(len(coords) - 1)
+    if len(coords) < 3:
+        return keep
+
+    threshold = float(max(turn_deg, 0.0))
+    for i in range(1, len(coords) - 1):
+        h1 = bearing_from_xy(
+            float(coords[i - 1, 0]),
+            float(coords[i - 1, 1]),
+            float(coords[i, 0]),
+            float(coords[i, 1]),
+        )
+        h2 = bearing_from_xy(
+            float(coords[i, 0]),
+            float(coords[i, 1]),
+            float(coords[i + 1, 0]),
+            float(coords[i + 1, 1]),
+        )
+        if angle_diff_deg(h1, h2) >= threshold:
+            keep.add(i)
+    return keep
+
+
+def smooth_polyline_preserve_turns(
+        coords: np.ndarray,
+        *,
+        passes: int,
+        turn_deg: float = 30.0,
+        neighbor_weight: float = 0.25,
+) -> np.ndarray:
+    """Smooth a polyline while preserving endpoints and sharp turns."""
+    out = coords.copy()
+    if len(out) <= 2 or passes <= 0:
+        return out
+
+    keep_idx = turn_indices(out, turn_deg=turn_deg)
+    alpha = float(np.clip(neighbor_weight, 0.0, 0.49))
+    center_w = 1.0 - 2.0 * alpha
+    for _ in range(passes):
+        nxt = out.copy()
+        for i in range(1, len(out) - 1):
+            if i in keep_idx:
+                continue
+            nxt[i] = alpha * out[i - 1] + center_w * out[i] + alpha * out[i + 1]
+        out = nxt
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Graph stitching  (polylines from edge set)
 # ---------------------------------------------------------------------------

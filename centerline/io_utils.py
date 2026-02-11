@@ -111,9 +111,65 @@ def infer_local_projected_crs(geometries: Sequence[LineString]) -> CRS:
     return CRS.from_epsg(epsg)
 
 
+def _read_vpd_table(
+    path: str | Path,
+    *,
+    usecols: list[str],
+    max_rows: int | None,
+) -> pd.DataFrame:
+    input_path = Path(path)
+    suffix = input_path.suffix.lower()
+
+    if suffix == ".parquet":
+        try:
+            df = pd.read_parquet(input_path, columns=usecols)
+        except Exception:
+            df = pd.read_parquet(input_path)
+            missing = [c for c in usecols if c not in df.columns]
+            if missing:
+                raise ValueError(
+                    f"VPD parquet is missing required columns: {missing}"
+                ) from None
+            df = df[usecols]
+        if max_rows is not None:
+            df = df.head(max_rows).copy()
+        return df
+
+    return pd.read_csv(input_path, usecols=usecols, nrows=max_rows)
+
+
+def _read_tabular_input(
+    path: str | Path,
+    *,
+    usecols: list[str] | None = None,
+    max_rows: int | None = None,
+) -> pd.DataFrame:
+    input_path = Path(path)
+    suffix = input_path.suffix.lower()
+    if suffix == ".parquet":
+        if usecols is not None:
+            try:
+                df = pd.read_parquet(input_path, columns=usecols)
+            except Exception:
+                df = pd.read_parquet(input_path)
+                missing = [c for c in usecols if c not in df.columns]
+                if missing:
+                    raise ValueError(
+                        f"Parquet file is missing required columns: {missing}"
+                    ) from None
+                df = df[usecols]
+        else:
+            df = pd.read_parquet(input_path)
+        if max_rows is not None:
+            df = df.head(max_rows).copy()
+        return df
+
+    return pd.read_csv(input_path, usecols=usecols, nrows=max_rows)
+
+
 def load_vpd_traces(csv_path: str | Path, fused_only: bool = True, max_rows: int | None = None) -> pd.DataFrame:
     """
-    Load VPD traces with WKT LINESTRING geometry and key attributes.
+    Load VPD traces from CSV or parquet with WKT LINESTRING geometry.
     """
     usecols = [
         "driveid",
@@ -129,7 +185,7 @@ def load_vpd_traces(csv_path: str | Path, fused_only: bool = True, max_rows: int
         "pathqualityscore",
         "sensorqualityscore",
     ]
-    df = pd.read_csv(csv_path, usecols=usecols, nrows=max_rows)
+    df = _read_vpd_table(csv_path, usecols=usecols, max_rows=max_rows)
     if fused_only and "fused" in df.columns:
         df = df[df["fused"].astype(str).str.lower().isin({"yes", "true", "1"})].copy()
 
@@ -203,7 +259,7 @@ def load_hpd_traces(csv_paths: Iterable[str | Path], max_rows_per_file: int | No
     usecols = ["heading", "latitude", "longitude", "traceid", "speed", "day", "time"]
 
     for p in csv_paths:
-        sub = pd.read_csv(p, usecols=usecols, nrows=max_rows_per_file)
+        sub = _read_tabular_input(p, usecols=usecols, max_rows=max_rows_per_file)
         sub["heading"] = pd.to_numeric(sub["heading"], errors="coerce")
         sub["latitude"] = pd.to_numeric(sub["latitude"], errors="coerce")
         sub["longitude"] = pd.to_numeric(sub["longitude"], errors="coerce")
@@ -276,11 +332,11 @@ def load_hpd_traces(csv_paths: Iterable[str | Path], max_rows_per_file: int | No
 
 def load_navstreet_csv(csv_path: str | Path) -> pd.DataFrame:
     """
-    Load HERE navstreet CSV as WGS84 lines.
+    Load HERE navstreet CSV/parquet as WGS84 lines.
     """
-    df = pd.read_csv(csv_path)
+    df = _read_tabular_input(csv_path, usecols=None, max_rows=None)
     if "geom" not in df.columns:
-        raise ValueError("Expected 'geom' column in navstreet CSV.")
+        raise ValueError("Expected 'geom' column in navstreet input.")
     df["geometry_parts"] = df["geom"].map(_safe_parse_wkt_linestrings)
     df = df[df["geometry_parts"].map(len) > 0].copy()
 

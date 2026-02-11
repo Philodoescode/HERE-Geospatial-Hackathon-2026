@@ -175,3 +175,36 @@ python scripts/evaluate_centerlines.py `
 
 - Roadster adaptation details: `context/roadster_adaptation_notes.md`
 - Preprocessing uses source-specific settings (tighter for VPD, more conservative for Probe/HPD).
+
+---
+
+### Kharita Recall Tuning (Problem 1)
+
+Use the recall-oriented tuner with full-bbox/no-GT-clipping evaluation and
+precision/size guardrails:
+
+```powershell
+python scripts/tune_kharita_recall.py `
+  --search random `
+  --trials 24 `
+  --apply-bbox `
+  --no-clip-generated-to-ground-truth `
+  --precision-floor 0.90 `
+  --max-length-ratio 2.0 `
+  --out-dir outputs/tuning_kharita_recall
+```
+
+This writes:
+
+- `outputs/tuning_kharita_recall/tuning_results.csv`
+- `outputs/tuning_kharita_recall/tuning_best.json`
+- `outputs/tuning_kharita_recall/comparison_metrics.csv` (baseline raw vs selected vs selected+turn-smoothing)
+
+### Roadster Tuning Helper
+
+```powershell
+python scripts/tune_roadster_params.py `
+  --search random `
+  --trials 24 `
+  --out-dir outputs/tuning_roadster
+```

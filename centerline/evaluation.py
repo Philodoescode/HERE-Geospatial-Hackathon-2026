@@ -20,6 +20,13 @@ from .io_utils import (
 )
 
 
+def _table_columns(path: str | Path) -> list[str]:
+    p = Path(path)
+    if p.suffix.lower() == ".parquet":
+        return pd.read_parquet(p).columns.tolist()
+    return pd.read_csv(p, nrows=0).columns.tolist()
+
+
 def _load_line_geodata(path: str | Path, layer: str | None = None) -> gpd.GeoDataFrame:
     path = Path(path)
     suffix = path.suffix.lower()
@@ -30,8 +37,8 @@ def _load_line_geodata(path: str | Path, layer: str | None = None) -> gpd.GeoDat
             gdf = gdf.set_crs("EPSG:4326")
         return gdf[gdf.geometry.notnull()].copy()
 
-    if suffix == ".csv":
-        df = pd.read_csv(path)
+    if suffix in {".csv", ".parquet"}:
+        df = pd.read_parquet(path) if suffix == ".parquet" else pd.read_csv(path)
         if "geometry_wkt" in df.columns:
             geom_col = "geometry_wkt"
         elif "geom" in df.columns:
@@ -390,7 +397,8 @@ def evaluate_centerlines(
     gen = _load_line_geodata(generated_centerlines, layer=generated_layer)
 
     gt_path = Path(ground_truth_navstreet)
-    if gt_path.suffix.lower() == ".csv" and "nav" in gt_path.name.lower() and "geom" in pd.read_csv(gt_path, nrows=0).columns:
+    gt_cols = _table_columns(gt_path) if gt_path.suffix.lower() in {".csv", ".parquet"} else []
+    if gt_path.suffix.lower() in {".csv", ".parquet"} and "nav" in gt_path.name.lower() and "geom" in gt_cols:
         gt_df = load_navstreet_csv(gt_path)
         gt = gpd.GeoDataFrame(gt_df, geometry="geometry", crs="EPSG:4326")
     else:
@@ -423,7 +431,8 @@ def generate_evaluation_plots(
 
     gen = _load_line_geodata(generated_centerlines, layer=generated_layer)
     gt_path = Path(ground_truth_navstreet)
-    if gt_path.suffix.lower() == ".csv" and "geom" in pd.read_csv(gt_path, nrows=0).columns:
+    gt_cols = _table_columns(gt_path) if gt_path.suffix.lower() in {".csv", ".parquet"} else []
+    if gt_path.suffix.lower() in {".csv", ".parquet"} and "geom" in gt_cols:
         gt_df = load_navstreet_csv(gt_path)
         gt = gpd.GeoDataFrame(gt_df, geometry="geometry", crs="EPSG:4326")
     else:
@@ -487,3 +496,5 @@ def save_metrics(metrics: dict, output_path: str | Path) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with output_path.open("w", encoding="utf-8") as f:
         json.dump(metrics, f, indent=2)
+    flat = pd.json_normalize(metrics, sep=".")
+    flat.to_parquet(output_path.with_suffix(".parquet"), index=False)

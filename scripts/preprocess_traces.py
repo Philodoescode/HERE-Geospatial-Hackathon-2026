@@ -123,6 +123,7 @@ def main() -> None:
 
     # Save CSV for debugging.
     csv_path = args.out_dir / f"{args.stem}.csv"
+    parquet_path = args.out_dir / f"{args.stem}.parquet"
     out_csv = pre.copy()
     out_csv["geometry_wkt"] = out_csv["geometry"].astype(str)
     out_csv["geometry_xy_wkt"] = out_csv["geometry_xy"].astype(str)
@@ -132,6 +133,7 @@ def main() -> None:
     out_csv["headings"] = out_csv["headings"].map(lambda a: json.dumps(np.asarray(a).tolist()))
     out_csv = out_csv.drop(columns=["geometry", "geometry_xy"])
     out_csv.to_csv(csv_path, index=False)
+    out_csv.to_parquet(parquet_path, index=False)
 
     summary = {
         "projected_crs": str(proj),
@@ -148,6 +150,7 @@ def main() -> None:
 
     print(f"Saved preprocessed traces: {gpkg_path}")
     print(f"Saved preprocessed CSV   : {csv_path}")
+    print(f"Saved preprocessed PQT   : {parquet_path}")
     print(f"Saved summary            : {summary_path}")
     print(f"Segments                 : {len(pre)}")
 

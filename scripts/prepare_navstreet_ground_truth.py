@@ -73,10 +73,12 @@ def main() -> None:
     write_gdf.to_file(gpkg_path, layer="navstreet", driver="GPKG")
 
     csv_path = args.out_dir / f"{args.stem}.csv"
+    parquet_path = args.out_dir / f"{args.stem}.parquet"
     out_csv = gdf.copy()
     out_csv["geometry_wkt"] = out_csv.geometry.astype(str)
     out_csv = out_csv.drop(columns=["geometry"])
     out_csv.to_csv(csv_path, index=False)
+    out_csv.to_parquet(parquet_path, index=False)
 
     # Build node-layer proxy from reference/non-reference node ids.
     node_rows = []
@@ -92,16 +94,23 @@ def main() -> None:
         node_rows.append({"node_id": str(r.nref_node_pvid), "lon": e_lon, "lat": e_lat})
 
     nodes_path = None
+    nodes_parquet_path = None
     if node_rows:
         nd = pd.DataFrame(node_rows).groupby("node_id", as_index=False).agg({"lon": "mean", "lat": "mean"})
         nodes_gdf = gpd.GeoDataFrame(nd, geometry=gpd.points_from_xy(nd["lon"], nd["lat"]), crs="EPSG:4326")
         nodes_path = args.out_dir / f"{args.stem}_nodes.gpkg"
         nodes_gdf.to_file(nodes_path, layer="navstreet_nodes", driver="GPKG")
+        nodes_parquet_path = args.out_dir / f"{args.stem}_nodes.parquet"
+        nodes_out = nodes_gdf.copy()
+        nodes_out["geometry_wkt"] = nodes_out.geometry.astype(str)
+        nodes_out = nodes_out.drop(columns=["geometry"])
+        nodes_out.to_parquet(nodes_parquet_path, index=False)
 
     # Save projected copy to simplify metric-space evaluation.
     proj_crs = infer_local_projected_crs(list(gdf.geometry))
     gdf_proj = gdf.to_crs(proj_crs)
     gpkg_proj_path = args.out_dir / f"{args.stem}_projected.gpkg"
+    parquet_proj_path = args.out_dir / f"{args.stem}_projected.parquet"
     write_proj = gdf_proj.drop(columns=["geom"], errors="ignore").copy()
     for c in write_proj.columns:
         if c == "geometry":
@@ -109,6 +118,10 @@ def main() -> None:
         if write_proj[c].dtype == "object":
             write_proj[c] = write_proj[c].map(lambda v: json.dumps(v) if isinstance(v, (list, dict, set)) else v)
     write_proj.to_file(gpkg_proj_path, layer="navstreet_projected", driver="GPKG")
+    out_proj = gdf_proj.copy()
+    out_proj["geometry_wkt"] = out_proj.geometry.astype(str)
+    out_proj = out_proj.drop(columns=["geometry"])
+    out_proj.to_parquet(parquet_proj_path, index=False)
 
     summary = {
         "rows": int(len(gdf)),
@@ -119,7 +132,10 @@ def main() -> None:
             "gpkg_wgs84": str(gpkg_path),
             "gpkg_projected": str(gpkg_proj_path),
             "csv": str(csv_path),
+            "parquet_wgs84": str(parquet_path),
+            "parquet_projected": str(parquet_proj_path),
             "nodes": str(nodes_path) if nodes_path is not None else None,
+            "nodes_parquet": str(nodes_parquet_path) if nodes_parquet_path is not None else None,
         },
     }
     summary_path = args.out_dir / f"{args.stem}_summary.json"
@@ -128,8 +144,11 @@ def main() -> None:
     print(f"Saved ground truth GPKG: {gpkg_path}")
     print(f"Saved projected GPKG   : {gpkg_proj_path}")
     print(f"Saved ground truth CSV : {csv_path}")
+    print(f"Saved ground truth PQT : {parquet_path}")
     if nodes_path is not None:
         print(f"Saved node layer       : {nodes_path}")
+    if nodes_parquet_path is not None:
+        print(f"Saved node parquet     : {nodes_parquet_path}")
     print(f"Saved summary          : {summary_path}")
     print(f"Rows: {len(gdf)}")
 

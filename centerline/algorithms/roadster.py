@@ -648,13 +648,14 @@ class RoadsterAlgorithm(BaseCenterlineAlgorithm):
                         "altitude_band": alt_band,
                         "support_k": 0.0,
                         "weighted_support": 0.0,
-                        "forward_support": 0.0,
-                        "reverse_support": 0.0,
+                        "dir_support": Counter(),
+                        "ref_dir": (a, b),
                         "vpd_support": 0.0,
                         "hpd_support": 0.0,
-                        "construction_sum": 0.0,
-                        "traffic_signal_sum": 0.0,
-                        "crosswalk_sum": 0.0,
+                        "construction_wsum": 0.0,
+                        "traffic_signal_wsum": 0.0,
+                        "crosswalk_wsum": 0.0,
+                        "attr_weight_sum": 0.0,
                         "day_counter": Counter(),
                         "hour_counter": Counter(),
                         "length_m": seg_len,
@@ -664,17 +665,15 @@ class RoadsterAlgorithm(BaseCenterlineAlgorithm):
                 s["support_k"] += float(rep["member_count"])
                 s["weighted_support"] += float(rep["weighted_support"])
 
-                orientation_is_forward = (a, b) == (u, v)
-                if orientation_is_forward:
-                    s["forward_support"] += float(rep["weighted_support"])
-                else:
-                    s["reverse_support"] += float(rep["weighted_support"])
+                rep_weight = float(rep["weighted_support"])
+                s["dir_support"][(int(a), int(b))] += rep_weight
 
                 s["vpd_support"] += float(rep["source_counts"].get("VPD", 0))
                 s["hpd_support"] += float(rep["source_counts"].get("HPD", 0))
-                s["construction_sum"] += float(rep["construction_percent_mean"])
-                s["traffic_signal_sum"] += float(rep["traffic_signal_mean"])
-                s["crosswalk_sum"] += float(rep["crosswalk_mean"])
+                s["construction_wsum"] += float(rep["construction_percent_mean"]) * rep_weight
+                s["traffic_signal_wsum"] += float(rep["traffic_signal_mean"]) * rep_weight
+                s["crosswalk_wsum"] += float(rep["crosswalk_mean"]) * rep_weight
+                s["attr_weight_sum"] += rep_weight
                 if rep["day_mode"] is not None:
                     s["day_counter"][int(rep["day_mode"])] += 1
                 if rep["hour_mode"] is not None:
@@ -685,6 +684,7 @@ class RoadsterAlgorithm(BaseCenterlineAlgorithm):
                     s["_best_geom_weight"] = float(rep["weighted_support"])
                     s["geometry_xy"] = seg
                     s["length_m"] = seg_len
+                    s["ref_dir"] = (int(a), int(b))
 
         if not edge_acc:
             return pd.DataFrame()
@@ -693,8 +693,9 @@ class RoadsterAlgorithm(BaseCenterlineAlgorithm):
         for s in edge_acc.values():
             if s["weighted_support"] < cfg.min_edge_support:
                 continue
-            fw = float(s["forward_support"])
-            rv = float(s["reverse_support"])
+            ref_a, ref_b = s.get("ref_dir", (int(s["u"]), int(s["v"])))
+            fw = float(s["dir_support"].get((int(ref_a), int(ref_b)), 0.0))
+            rv = float(s["dir_support"].get((int(ref_b), int(ref_a)), 0.0))
             tot = fw + rv
             if tot <= 0:
                 continue
@@ -706,18 +707,28 @@ class RoadsterAlgorithm(BaseCenterlineAlgorithm):
             else:
                 dir_travel = "F"
 
+            attr_weight = float(s.get("attr_weight_sum", 0.0))
+            if attr_weight > 0.0:
+                construction_mean = float(s["construction_wsum"] / attr_weight)
+                traffic_signal_mean = float(s["traffic_signal_wsum"] / attr_weight)
+                crosswalk_mean = float(s["crosswalk_wsum"] / attr_weight)
+            else:
+                construction_mean = float("nan")
+                traffic_signal_mean = float("nan")
+                crosswalk_mean = float("nan")
+
             rows.append(
                 {
-                    "u": int(s["u"]),
-                    "v": int(s["v"]),
+                    "u": int(ref_a),
+                    "v": int(ref_b),
                     "support_k": float(s["support_k"]),
                     "weighted_support": float(s["weighted_support"]),
                     "length_m": float(s["length_m"]),
                     "vpd_support": float(s["vpd_support"]),
                     "hpd_support": float(s["hpd_support"]),
-                    "construction_percent_mean": float(s["construction_sum"] / max(s["support_k"], 1.0)),
-                    "traffic_signal_count_mean": float(s["traffic_signal_sum"] / max(s["support_k"], 1.0)),
-                    "crosswalk_count_mean": float(s["crosswalk_sum"] / max(s["support_k"], 1.0)),
+                    "construction_percent_mean": construction_mean,
+                    "traffic_signal_count_mean": traffic_signal_mean,
+                    "crosswalk_count_mean": crosswalk_mean,
                     "day_mode": s["day_counter"].most_common(1)[0][0] if s["day_counter"] else None,
                     "hour_mode": s["hour_counter"].most_common(1)[0][0] if s["hour_counter"] else None,
                     "altitude_band": int(s["altitude_band"]),

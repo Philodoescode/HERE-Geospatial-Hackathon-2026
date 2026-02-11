@@ -87,27 +87,6 @@ Lead GIS Data Engineer
 
 ---
 
-### Problem 2 – Road Geometry Filtering & Classification
-**Goal:** Build a system to classify detected road geometries and decide whether they should be ingested into the road network.
-
-#### Key focus areas:
-*   Use of probe and VPD signals (density, directionality, temporal consistency)
-*   Distinguishing navigable roads from low-value or non-navigable\routable paths
-*   Handling ambiguous cases and minimizing false positives
-
-#### Key Deliverables:
-*   Classification approach* or model description (ML-based, rule-based,..)
-*   Definition of input features and class labels
-*   Classification results with performance metrics
-*   Error analysis and examples of misclassified geometries
-
-***Example of possible classes:**
-*   Public navigable roads
-*   Restricted or residential roads
-*   Parking entrances, service roads
-
----
-
 ## Judging Criteria
 
 | Criterion | Question |

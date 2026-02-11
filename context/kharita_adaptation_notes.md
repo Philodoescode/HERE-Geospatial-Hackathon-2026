@@ -16,5 +16,7 @@ This implementation keeps the core Kharita idea and adapts it to the HERE VPD/HP
 
 3. **Quality upgrades over legacy Kharita code**
 - Incremental clustering is vector-safe and scalable for larger HERE traces.
-- Centerlines are stitched into continuous chains and smoothed with Chaikin refinement.
+- Centerlines are stitched into continuous chains and smoothed with turn-preserving refinement.
+- Problem 1 heuristic candidate selection scores each centerline by support, density, length, connectivity, and geometric plausibility.
+- Selection metadata is emitted per centerline: `is_selected`, `selection_score`, and `selection_reason`.
 - Added ground-truth validation against Kosovo navstreets with quantitative metrics.
