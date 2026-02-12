@@ -30,7 +30,7 @@ import pandas as pd
 from pyproj import CRS, Transformer
 from scipy.spatial import cKDTree
 from shapely import get_coordinates
-from shapely.geometry import LineString
+from shapely.geometry import LineString, Point
 from shapely.ops import transform as shapely_transform
 
 warnings.filterwarnings("ignore")
@@ -50,6 +50,10 @@ from src.algorithms.centerline_utils import (
     smooth_polyline_preserve_turns,
     shortest_alternative_with_hop_limit,
     stitch_centerline_paths,
+    interpolate_edge_with_traces,
+    detect_high_curvature_zones,
+    separate_z_levels,
+    compute_curvature_at_point,
 )
 from src.algorithms.roundabout_detection import (
     RoundaboutConfig,
@@ -61,6 +65,23 @@ from src.algorithms.roundabout_detection import (
 from src.algorithms.curve_smoothing import (
     simplify_and_smooth_centerline,
     merge_nearby_points,
+)
+from src.algorithms.intersection_detection import (
+    IntersectionDetector,
+    IntersectionNode,
+    detect_intersections,
+    split_lines_at_intersections,
+)
+from src.algorithms.segment_averaging import (
+    SegmentAveragingConfig,
+    SegmentGrouper,
+    SegmentAverager,
+    average_segment_groups,
+)
+from src.algorithms.topology_builder import (
+    TopologyConfig,
+    TopologyBuilder,
+    build_topology,
 )
 
 
@@ -78,6 +99,17 @@ class KharitaConfig:
     heading_tolerance_deg: float = 55.0  # Increased for better curve handling
     heading_distance_weight_m: float = 0.18  # Reduced to favor spatial proximity on curves
     min_cluster_points: int = 1
+    
+    # Z-level handling (for bridges/overpasses at interchanges)
+    enable_z_level_separation: bool = True
+    z_separation_threshold_m: float = 3.0  # Min altitude difference to consider separate
+    z_level_cluster_penalty: float = 50.0  # Penalty for crossing Z-levels in clustering
+    
+    # Curve-aware centerline generation (fixes cloverleaf chord cutting)
+    enable_curve_interpolation: bool = True
+    curve_min_edge_length_m: float = 25.0  # Only interpolate edges longer than this
+    curve_max_deviation_m: float = 3.0  # When trace points deviate more than this, use curve
+    curve_curvature_threshold: float = 0.015  # 1/67m radius = typical interchange ramp
     
     # Edge extraction
     max_transition_distance_m: float = 50.0
@@ -140,8 +172,22 @@ class KharitaConfig:
     
     # Post-processing: merge parallel overlapping centerlines
     enable_parallel_merge: bool = True
-    parallel_merge_buffer_m: float = 6.0
+    parallel_merge_buffer_m: float = 10.0      # Lateral corridor buffer (meters)
     parallel_merge_heading_tol_deg: float = 25.0
+    parallel_merge_min_overlap: float = 0.65   # Min fraction of shorter inside longer's buffer
+    
+    # Intersection-based topology (NEW: replaces simple parallel merge)
+    enable_intersection_topology: bool = True
+    intersection_snap_radius_m: float = 8.0  # Radius for clustering endpoints
+    intersection_min_degree: int = 1  # Minimum node degree to keep
+    
+    # Fréchet averaging (NEW: replaces winner-takes-all deduplication)
+    enable_frechet_averaging: bool = True
+    frechet_corridor_buffer_m: float = 12.0  # Corridor for grouping parallels
+    frechet_heading_tolerance_deg: float = 30.0  # Max heading difference
+    frechet_min_overlap: float = 0.60  # Min corridor overlap for grouping
+    frechet_resample_spacing_m: float = 5.0  # Target spacing for resampling
+    frechet_eccentricity_power: float = 1.0  # Outlier penalization strength
 
 
 class KharitaCenterlineGenerator:
@@ -215,7 +261,7 @@ class KharitaCenterlineGenerator:
     #  TRACE SAMPLING
     # ------------------------------------------------------------------
     
-    def _sample_traces(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, Dict[int, Tuple[int, int]], Dict[int, dict]]:
+    def _sample_traces(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, Dict[int, Tuple[int, int]], Dict[int, dict]]:
         """
         Sample all traces at regular intervals.
         
@@ -224,6 +270,7 @@ class KharitaCenterlineGenerator:
             y_arr: Y coordinates of all sample points
             heading_arr: Headings at all sample points
             weight_arr: Weights for all sample points
+            altitude_arr: Altitude values for all sample points (NaN if unavailable)
             trace_ranges: Dict mapping trace_id -> (start_idx, end_idx)
             trace_meta: Dict mapping trace_id -> metadata
         """
@@ -235,6 +282,7 @@ class KharitaCenterlineGenerator:
         ys: List[float] = []
         headings_list: List[float] = []
         point_weights: List[float] = []
+        altitudes: List[float] = []  # Z-level data for interchange handling
         
         trace_ranges: Dict[int, Tuple[int, int]] = {}
         trace_meta: Dict[int, dict] = {}
@@ -250,6 +298,11 @@ class KharitaCenterlineGenerator:
             
             if line_xy.is_empty or line_xy.length <= 1.0:
                 continue
+            
+            # Get altitude data if available (for Z-level separation at interchanges)
+            trace_altitude = np.nan
+            if "mean_altitude" in row.index and pd.notna(row.get("mean_altitude")):
+                trace_altitude = float(row["mean_altitude"])
             
             # Sample the projected line
             sample_dists, sample_xy, sample_headings = sample_line_projected(
@@ -295,6 +348,7 @@ class KharitaCenterlineGenerator:
                 ys.append(float(sample_xy[i, 1]))
                 headings_list.append(float(sample_headings[i]))
                 point_weights.append(base_weight)
+                altitudes.append(trace_altitude)  # Same altitude for all points in trace
             end = len(xs)
             
             trace_ranges[next_trace_id] = (start, end)
@@ -305,21 +359,28 @@ class KharitaCenterlineGenerator:
                 "traffic_signal_count": float(row.get("traffic_signal_count", 0.0) or 0.0),
                 "day": int(row["day"]) if pd.notnull(row.get("day", np.nan)) else None,
                 "hour": int(row["hour"]) if pd.notnull(row.get("hour", np.nan)) else None,
+                "mean_altitude": trace_altitude,
             }
             next_trace_id += 1
         
         elapsed = time.time() - t0
         print(f"    Sampled {len(xs)} points from {next_trace_id} traces in {elapsed:.1f}s")
         
+        # Log altitude coverage
+        alt_arr = np.asarray(altitudes, dtype=np.float32)
+        n_with_alt = np.sum(~np.isnan(alt_arr))
+        if n_with_alt > 0:
+            print(f"    Z-level data: {n_with_alt}/{len(alt_arr)} points have altitude")
+        
         x_arr = np.asarray(xs, dtype=np.float32)
         y_arr = np.asarray(ys, dtype=np.float32)
         heading_arr = np.asarray(headings_list, dtype=np.float32)
         weight_arr = np.asarray(point_weights, dtype=np.float32)
         
-        return x_arr, y_arr, heading_arr, weight_arr, trace_ranges, trace_meta
+        return x_arr, y_arr, heading_arr, weight_arr, alt_arr, trace_ranges, trace_meta
     
     # ------------------------------------------------------------------
-    #  HEADING-AWARE CLUSTERING
+    #  HEADING-AWARE CLUSTERING (with Z-level separation for interchanges)
     # ------------------------------------------------------------------
     
     def _kharita_clustering(
@@ -328,6 +389,7 @@ class KharitaCenterlineGenerator:
         ys: np.ndarray,
         headings: np.ndarray,
         point_weights: np.ndarray,
+        altitudes: np.ndarray = None,
     ) -> Tuple[np.ndarray, pd.DataFrame]:
         """
         Heading-aware incremental clustering (Kharita-style).
@@ -335,20 +397,29 @@ class KharitaCenterlineGenerator:
         Points are assigned to clusters based on:
           - Spatial distance (within cluster_radius_m)
           - Heading similarity (within heading_tolerance_deg)
+          - Z-level similarity (for bridge/overpass separation at interchanges)
         
         Cluster centroids and headings are updated incrementally.
         """
-        print("  Performing heading-aware clustering...")
+        print("  Performing heading-aware clustering (with Z-level separation)...")
         t0 = time.time()
         config = self.config
         
         n = len(xs)
         if n == 0:
             return np.array([], dtype=np.int32), pd.DataFrame(
-                columns=["node_id", "x", "y", "heading", "weight", "point_count"]
+                columns=["node_id", "x", "y", "heading", "weight", "point_count", "mean_altitude"]
             )
         
         labels = np.full(n, -1, dtype=np.int32)
+        
+        # Z-level handling for interchange separation
+        use_z_level = config.enable_z_level_separation and altitudes is not None
+        if use_z_level:
+            n_valid_alt = np.sum(~np.isnan(altitudes))
+            if n_valid_alt < n * 0.1:  # Less than 10% have altitude
+                use_z_level = False
+                print("    Note: Z-level separation disabled (insufficient altitude data)")
         
         # Cluster state
         cx: List[float] = []  # centroid x
@@ -357,6 +428,8 @@ class KharitaCenterlineGenerator:
         csin: List[float] = []  # weighted sin(heading)
         ccos: List[float] = []  # weighted cos(heading)
         ccount: List[int] = []  # point count
+        calt: List[float] = []  # mean altitude (for Z-level separation)
+        calt_count: List[int] = []  # count of points with valid altitude
         
         tree = None
         dirty_count = 0
@@ -375,6 +448,7 @@ class KharitaCenterlineGenerator:
             y = float(ys[i])
             heading = float(headings[i])
             w = float(max(point_weights[i], 1e-6))
+            point_alt = float(altitudes[i]) if use_z_level else np.nan
             
             # First point creates first cluster
             if not cx:
@@ -385,6 +459,12 @@ class KharitaCenterlineGenerator:
                 csin.append(math.sin(rad) * w)
                 ccos.append(math.cos(rad) * w)
                 ccount.append(1)
+                if use_z_level and not math.isnan(point_alt):
+                    calt.append(point_alt)
+                    calt_count.append(1)
+                else:
+                    calt.append(np.nan)
+                    calt_count.append(0)
                 labels[i] = 0
                 rebuild_tree()
                 continue
@@ -401,7 +481,7 @@ class KharitaCenterlineGenerator:
                 else []
             )
             
-            # Find best matching cluster (closest in combined spatial+heading distance)
+            # Find best matching cluster (closest in combined spatial+heading+z-level distance)
             best_cid = -1
             best_score = float("inf")
             
@@ -414,9 +494,19 @@ class KharitaCenterlineGenerator:
                 if ad > config.heading_tolerance_deg:
                     continue
                 
-                # Combined distance (spatial + heading penalty)
+                # Z-level penalty for interchange separation (don't merge bridge with underpass)
+                z_penalty = 0.0
+                if use_z_level and not math.isnan(point_alt) and calt_count[cid] > 0:
+                    cluster_alt = calt[cid]
+                    if not math.isnan(cluster_alt):
+                        alt_diff = abs(point_alt - cluster_alt)
+                        if alt_diff > config.z_separation_threshold_m:
+                            # Large Z difference - likely different road levels
+                            z_penalty = config.z_level_cluster_penalty
+                
+                # Combined distance (spatial + heading penalty + z-level penalty)
                 sd = math.hypot(x - cx[cid], y - cy[cid])
-                score = sd + config.heading_distance_weight_m * ad
+                score = sd + config.heading_distance_weight_m * ad + z_penalty
                 
                 if score < best_score:
                     best_score = score
@@ -432,6 +522,12 @@ class KharitaCenterlineGenerator:
                 csin.append(math.sin(rad) * w)
                 ccos.append(math.cos(rad) * w)
                 ccount.append(1)
+                if use_z_level and not math.isnan(point_alt):
+                    calt.append(point_alt)
+                    calt_count.append(1)
+                else:
+                    calt.append(np.nan)
+                    calt_count.append(0)
                 labels[i] = cid
                 dirty_count += 1
                 continue
@@ -447,10 +543,19 @@ class KharitaCenterlineGenerator:
             csin[cid] += math.sin(rad) * w
             ccos[cid] += math.cos(rad) * w
             ccount[cid] += 1
+            # Update altitude tracking
+            if use_z_level and not math.isnan(point_alt):
+                if calt_count[cid] == 0:
+                    calt[cid] = point_alt
+                else:
+                    # Weighted average of altitude
+                    old_alt = calt[cid] if not math.isnan(calt[cid]) else point_alt
+                    calt[cid] = (old_alt * calt_count[cid] + point_alt) / (calt_count[cid] + 1)
+                calt_count[cid] += 1
             labels[i] = cid
             dirty_count += 1
         
-        # Collapse small clusters into nearby larger ones
+        # Collapse small clusters into nearby larger ones (consider Z-level)
         if config.min_cluster_points > 1 and cx:
             major_ids = [i for i, cnt in enumerate(ccount) if cnt >= config.min_cluster_points]
             if major_ids:
@@ -466,7 +571,15 @@ class KharitaCenterlineGenerator:
                         continue
                     d, idx = major_tree.query([cx[cid], cy[cid]], k=1)
                     target = major_ids[int(idx)]
-                    if float(d) <= config.cluster_radius_m * 1.25:
+                    
+                    # Check Z-level compatibility before merging
+                    z_compatible = True
+                    if use_z_level and calt_count[cid] > 0 and calt_count[target] > 0:
+                        if not math.isnan(calt[cid]) and not math.isnan(calt[target]):
+                            if abs(calt[cid] - calt[target]) > config.z_separation_threshold_m:
+                                z_compatible = False
+                    
+                    if float(d) <= config.cluster_radius_m * 1.25 and z_compatible:
                         remap[cid] = target
                 
                 labels = np.asarray([remap[int(cid)] for cid in labels], dtype=np.int32)
@@ -476,9 +589,10 @@ class KharitaCenterlineGenerator:
         to_new = {old: new for new, old in enumerate(unique)}
         labels = np.asarray([to_new[int(v)] for v in labels], dtype=np.int32)
         
-        # Recompute node stats from final assignments
+        # Recompute node stats from final assignments (including altitude)
         node_stats = defaultdict(
-            lambda: {"xw": 0.0, "yw": 0.0, "w": 0.0, "sinw": 0.0, "cosw": 0.0, "n": 0}
+            lambda: {"xw": 0.0, "yw": 0.0, "w": 0.0, "sinw": 0.0, "cosw": 0.0, "n": 0, 
+                     "alt_sum": 0.0, "alt_n": 0}
         )
         
         for i, nid in enumerate(labels):
@@ -490,12 +604,17 @@ class KharitaCenterlineGenerator:
             node_stats[int(nid)]["sinw"] += math.sin(rad) * w
             node_stats[int(nid)]["cosw"] += math.cos(rad) * w
             node_stats[int(nid)]["n"] += 1
+            # Track altitude
+            if use_z_level and not math.isnan(altitudes[i]):
+                node_stats[int(nid)]["alt_sum"] += float(altitudes[i])
+                node_stats[int(nid)]["alt_n"] += 1
         
-        # Build nodes dataframe
+        # Build nodes dataframe (with altitude for Z-level handling)
         rows = []
         for nid in sorted(node_stats):
             s = node_stats[nid]
             ww = s["w"] if s["w"] > 0 else 1.0
+            mean_alt = s["alt_sum"] / s["alt_n"] if s["alt_n"] > 0 else np.nan
             rows.append({
                 "node_id": nid,
                 "x": s["xw"] / ww,
@@ -503,6 +622,7 @@ class KharitaCenterlineGenerator:
                 "heading": (math.degrees(math.atan2(s["sinw"], s["cosw"])) + 360.0) % 360.0,
                 "weight": s["w"],
                 "point_count": s["n"],
+                "mean_altitude": mean_alt,
             })
         
         elapsed = time.time() - t0
@@ -696,8 +816,57 @@ class KharitaCenterlineGenerator:
         return edge_support
     
     # ------------------------------------------------------------------
-    #  CENTERLINE STITCHING + CANDIDATE SELECTION
+    #  CENTERLINE STITCHING + CANDIDATE SELECTION (with curve interpolation)
     # ------------------------------------------------------------------
+    
+    def _precompute_edge_trace_points(self):
+        """
+        Pre-compute lookup table mapping edges to their trace points.
+        
+        Called once after clustering to enable O(1) edge point lookups
+        during centerline stitching (vs O(n) per edge before).
+        """
+        if self._trace_labels is None or self._trace_points_xy is None:
+            self._edge_trace_points = {}
+            return
+        
+        print("    Pre-computing edge trace points lookup...")
+        t0 = time.time()
+        
+        labels = self._trace_labels
+        points = self._trace_points_xy
+        edge_points = {}  # (u, v) -> list of (x, y)
+        
+        for i in range(1, len(labels)):
+            u, v = int(labels[i-1]), int(labels[i])
+            if u == v:
+                continue
+            
+            # Canonical edge key (smaller node first for bidirectional)
+            key = (min(u, v), max(u, v))
+            
+            if key not in edge_points:
+                edge_points[key] = []
+            
+            # Add both endpoints of the transition
+            edge_points[key].append((float(points[i-1, 0]), float(points[i-1, 1])))
+            edge_points[key].append((float(points[i, 0]), float(points[i, 1])))
+        
+        self._edge_trace_points = edge_points
+        print(f"    Pre-computed {len(edge_points)} edge lookups in {time.time() - t0:.1f}s")
+    
+    def _get_edge_trace_points(self, u: int, v: int) -> List[Tuple[float, float]]:
+        """
+        Get trace points that contributed to an edge (for curve interpolation).
+        
+        Uses precomputed lookup for O(1) access.
+        """
+        if not hasattr(self, '_edge_trace_points') or self._edge_trace_points is None:
+            return []
+        
+        # Canonical key (smaller node first)
+        key = (min(u, v), max(u, v))
+        return self._edge_trace_points.get(key, [])
     
     def _stitch_centerlines(
         self,
@@ -706,8 +875,10 @@ class KharitaCenterlineGenerator:
     ) -> pd.DataFrame:
         """
         Stitch edges into centerline paths with smoothing.
+        
+        Includes curve-aware interpolation to fix "chord cutting" on cloverleaf ramps.
         """
-        print("  Stitching centerlines...")
+        print("  Stitching centerlines (with curve interpolation)...")
         t0 = time.time()
         config = self.config
         
@@ -716,13 +887,51 @@ class KharitaCenterlineGenerator:
         print(f"    Found {len(centerline_paths)} centerline paths")
         
         centerline_rows = []
+        curves_interpolated = 0
         
         for path_nodes in centerline_paths:
             if len(path_nodes) < 2:
                 continue
             
-            # Get raw coordinates
-            raw_xy = np.asarray([node_xy[n] for n in path_nodes], dtype=np.float64)
+            # Build path coordinates with curve-aware interpolation
+            if config.enable_curve_interpolation:
+                path_coords = [node_xy[path_nodes[0]]]
+                
+                for i in range(1, len(path_nodes)):
+                    u, v = path_nodes[i-1], path_nodes[i]
+                    start_xy = node_xy[u]
+                    end_xy = node_xy[v]
+                    edge_length = math.hypot(end_xy[0] - start_xy[0], end_xy[1] - start_xy[1])
+                    
+                    # Only interpolate longer edges where curves matter
+                    if edge_length >= config.curve_min_edge_length_m:
+                        # Get trace points for this edge
+                        edge_trace_pts = self._get_edge_trace_points(u, v)
+                        
+                        if len(edge_trace_pts) >= 3:
+                            # Use curve interpolation
+                            interpolated = interpolate_edge_with_traces(
+                                start_xy=start_xy,
+                                end_xy=end_xy,
+                                trace_points=edge_trace_pts,
+                                edge_length_m=edge_length,
+                                min_intermediate_points=2,
+                                max_deviation_m=config.curve_max_deviation_m,
+                            )
+                            # Add intermediate points (skip start as it's already in path)
+                            for pt in interpolated[1:]:
+                                path_coords.append(pt)
+                            if len(interpolated) > 2:
+                                curves_interpolated += 1
+                        else:
+                            path_coords.append(end_xy)
+                    else:
+                        path_coords.append(end_xy)
+                
+                raw_xy = np.asarray(path_coords, dtype=np.float64)
+            else:
+                # Original: just use node centroids
+                raw_xy = np.asarray([node_xy[n] for n in path_nodes], dtype=np.float64)
             
             # Apply turn-preserving smoothing
             if config.use_turn_preserving_smoothing:
@@ -795,6 +1004,8 @@ class KharitaCenterlineGenerator:
         
         elapsed = time.time() - t0
         print(f"    Created {len(centerline_rows)} centerlines in {elapsed:.1f}s")
+        if curves_interpolated > 0:
+            print(f"    Curve interpolation: {curves_interpolated} edges enhanced for cloverleaf/ramp handling")
         
         return pd.DataFrame(centerline_rows)
     
@@ -884,99 +1095,508 @@ class KharitaCenterlineGenerator:
     
     def _merge_parallel_centerlines(self, centerlines: pd.DataFrame) -> pd.DataFrame:
         """
-        Merge parallel overlapping centerlines on curves.
+        Remove duplicate/sub-segment centerlines using corridor-based overlap.
         
-        This addresses the issue where Kharita clustering creates multiple
-        closely-spaced clusters on curves, resulting in overlapping centerlines.
-        We identify pairs of parallel lines within a buffer and keep the stronger one.
+        For each segment, check if it's contained within a longer, higher-quality
+        segment's corridor. If so, remove it. NO Union-Find to avoid transitive
+        chains that incorrectly merge segments from different roads.
+        
+        Two types of duplicates:
+        1. Sub-segments: shorter line is >70% inside longer line's buffer
+        2. True parallels: similar-length lines are MUTUALLY >70% inside each other
         """
         config = self.config
         
         if not config.enable_parallel_merge or centerlines.empty:
             return centerlines
         
-        print("  Merging parallel overlapping centerlines...")
+        print("  Removing duplicate/sub-segment centerlines (corridor overlap)...")
         
-        # Convert to GeoDataFrame for spatial operations
         gdf = gpd.GeoDataFrame(centerlines, crs="EPSG:4326")
-        
-        # Project to local CRS for accurate distance calculations
         gdf = gdf.to_crs(self.crs_projected)
+        n = len(gdf)
         
-        # Compute headings and lengths
         def get_heading(geom):
             if geom is None or geom.is_empty or len(geom.coords) < 2:
                 return 0.0
             coords = np.array(geom.coords)
             dx = coords[-1, 0] - coords[0, 0]
             dy = coords[-1, 1] - coords[0, 1]
-            h = np.degrees(np.arctan2(dy, dx)) % 180.0  # Direction-agnostic
-            return h
+            return np.degrees(np.arctan2(dy, dx)) % 180.0
         
         headings = np.array([get_heading(g) for g in gdf.geometry])
         lengths = gdf.geometry.length.values
-        supports = gdf["weighted_support"].values if "weighted_support" in gdf.columns else np.ones(len(gdf))
+        supports = gdf["weighted_support"].values if "weighted_support" in gdf.columns else np.ones(n)
+        scores = supports * lengths
         
-        # Build spatial index
         from shapely import STRtree
-        tree = STRtree(gdf.geometry.values)
+        geoms = gdf.geometry.values
         
-        # Find parallel overlapping pairs
+        buf_dist = config.parallel_merge_buffer_m
+        buffered_geoms = [g.buffer(buf_dist) for g in geoms]
+        
+        # Spatial pre-filter
+        tree = STRtree(geoms)
+        query_distance = buf_dist + 5.0
+        left_idx, right_idx = tree.query(geoms, predicate="dwithin", distance=query_distance)
+        
+        # Build adjacency: for each segment, list of nearby segments
+        neighbors = defaultdict(list)
+        for k in range(len(left_idx)):
+            i, j = int(left_idx[k]), int(right_idx[k])
+            if i != j:
+                neighbors[i].append(j)
+                neighbors[j].append(i)
+        
         to_remove = set()
+        overlap_count = 0
         
-        for i in range(len(gdf)):
+        # For each segment, check if it should be removed
+        for i in range(n):
             if i in to_remove:
                 continue
             
-            geom_i = gdf.geometry.iloc[i]
-            buffered = geom_i.buffer(config.parallel_merge_buffer_m)
+            len_i = lengths[i]
+            if len_i < 1.0:
+                continue
             
-            # Query nearby geometries
-            candidates = tree.query(buffered)
-            
-            for j in candidates:
-                if j <= i or j in to_remove:
+            for j in neighbors[i]:
+                if j in to_remove:
                     continue
                 
-                geom_j = gdf.geometry.iloc[j]
+                len_j = lengths[j]
+                if len_j < 1.0:
+                    continue
                 
-                # Check heading compatibility (parallel)
+                # Heading compatibility
                 h_diff = abs(headings[i] - headings[j])
-                h_diff = min(h_diff, 180 - h_diff)
-                
+                h_diff = min(h_diff, 180.0 - h_diff)
                 if h_diff > config.parallel_merge_heading_tol_deg:
                     continue
                 
-                # Check overlap
+                # Determine which is shorter/longer
+                if len_i <= len_j:
+                    shorter_idx, longer_idx = i, j
+                    shorter_len, longer_len = len_i, len_j
+                    shorter_geom = geoms[i]
+                    longer_buf = buffered_geoms[j]
+                else:
+                    shorter_idx, longer_idx = j, i
+                    shorter_len, longer_len = len_j, len_i
+                    shorter_geom = geoms[j]
+                    longer_buf = buffered_geoms[i]
+                
+                # Check corridor overlap: is shorter inside longer's buffer?
                 try:
-                    intersection = geom_i.buffer(config.parallel_merge_buffer_m).intersection(geom_j)
-                    overlap_ratio = intersection.length / min(lengths[i], lengths[j]) if min(lengths[i], lengths[j]) > 0 else 0
+                    inside = shorter_geom.intersection(longer_buf)
+                    corridor_ratio = inside.length / shorter_len
                 except Exception:
                     continue
                 
-                if overlap_ratio < 0.5:
+                if corridor_ratio < config.parallel_merge_min_overlap:
                     continue
                 
-                # Remove the weaker one (lower support or shorter)
-                score_i = supports[i] * lengths[i]
-                score_j = supports[j] * lengths[j]
+                # Length ratio check: for very different lengths, require higher overlap
+                len_ratio = shorter_len / longer_len
+                if len_ratio < 0.3 and corridor_ratio < 0.85:
+                    # Short stub that only partially overlaps - might be a side street
+                    continue
                 
-                if score_i >= score_j:
-                    to_remove.add(j)
+                # If similar lengths, require MUTUAL overlap (true parallel duplicate)
+                if len_ratio > 0.7:
+                    try:
+                        longer_geom = geoms[longer_idx]
+                        shorter_buf = buffered_geoms[shorter_idx]
+                        reverse_inside = longer_geom.intersection(shorter_buf)
+                        reverse_ratio = reverse_inside.length / longer_len
+                    except Exception:
+                        continue
+                    
+                    if reverse_ratio < config.parallel_merge_min_overlap * 0.8:
+                        # Not mutually overlapping - different roads that just touch
+                        continue
+                
+                # This is a duplicate - remove the one with lower score
+                if scores[shorter_idx] < scores[longer_idx]:
+                    to_remove.add(shorter_idx)
                 else:
-                    to_remove.add(i)
-                    break  # Move to next i since current i is removed
+                    to_remove.add(longer_idx)
+                overlap_count += 1
         
-        if to_remove:
-            keep_mask = [i not in to_remove for i in range(len(gdf))]
-            gdf = gdf[keep_mask].reset_index(drop=True)
-        
-        # Convert back to WGS84
+        keep_mask = [i not in to_remove for i in range(n)]
+        gdf = gdf[keep_mask].reset_index(drop=True)
         gdf = gdf.to_crs("EPSG:4326")
         
-        removed = len(centerlines) - len(gdf)
-        print(f"    Merged {removed} parallel overlapping centerlines")
+        removed = len(to_remove)
+        print(f"    Found {overlap_count} duplicate pairs, removed {removed} centerlines")
+        print(f"    Merged {removed} duplicate/sub-segment centerlines")
         
+        return pd.DataFrame(gdf.drop(columns=["geometry"])).assign(geometry=gdf.geometry)
+    
+    # ------------------------------------------------------------------
+    #  INTERSECTION-BASED TOPOLOGY DEDUPLICATION (NEW)
+    # ------------------------------------------------------------------
+    
+    def _topology_based_deduplication(self, centerlines: pd.DataFrame) -> pd.DataFrame:
+        """
+        Apply intersection-based topology and Fréchet averaging for deduplication.
+        
+        This replaces the simple winner-takes-all parallel merge with:
+        1. Detect all intersection points (endpoint + mid-segment)
+        2. Split lines at intersection points
+        3. Group overlapping segments between same node pairs
+        4. Average each group using Fréchet-weighted median
+        5. Build final topology network
+        
+        Preserves curvature and Z-level separation.
+        """
+        config = self.config
+        
+        if not config.enable_intersection_topology:
+            return centerlines
+        
+        if centerlines.empty:
+            return centerlines
+        
+        print("  Applying intersection-based topology deduplication...")
+        
+        # Convert to projected CRS for metric operations
+        gdf = gpd.GeoDataFrame(centerlines, crs="EPSG:4326")
+        gdf = gdf.to_crs(self.crs_projected)
+        
+        geometries = list(gdf.geometry)
+        segment_ids = list(range(len(geometries)))
+        supports = gdf["weighted_support"].values if "weighted_support" in gdf.columns else np.ones(len(gdf))
+        altitudes = gdf["altitude_mean"].values if "altitude_mean" in gdf.columns else [np.nan] * len(gdf)
+        sources = gdf["source"].values if "source" in gdf.columns else ["unknown"] * len(gdf)
+        
+        # Step 1: Detect intersections
+        print("    Detecting intersection points...")
+        intersections, segment_nodes = detect_intersections(
+            geometries=geometries,
+            segment_ids=segment_ids,
+            snap_radius_m=config.intersection_snap_radius_m,
+            min_degree=config.intersection_min_degree,
+        )
+        print(f"    Found {len(intersections)} intersection nodes")
+        
+        # Step 2: Split lines at mid-segment intersections
+        print("    Splitting lines at intersection points...")
+        split_geoms, split_ids, node_assignments = split_lines_at_intersections(
+            geometries=geometries,
+            segment_ids=segment_ids,
+            intersections=intersections,
+            tolerance_m=config.intersection_snap_radius_m,
+        )
+        print(f"    Split into {len(split_geoms)} atomic segments")
+        
+        # Step 2.5: Properly assign node IDs to ALL segment endpoints
+        # The split function only assigns nodes to split points, not to original endpoints
+        # We need to match each endpoint to the nearest intersection node
+        print("    Assigning node IDs to all segment endpoints...")
+        int_coords = np.array([(n.x, n.y) for n in intersections])
+        int_tree = cKDTree(int_coords) if len(int_coords) > 0 else None
+        
+        proper_node_assignments = []
+        for i, geom in enumerate(split_geoms):
+            if geom is None or geom.is_empty:
+                proper_node_assignments.append((None, None))
+                continue
+            
+            coords = list(geom.coords)
+            start_pt = np.array([coords[0][0], coords[0][1]])
+            end_pt = np.array([coords[-1][0], coords[-1][1]])
+            
+            start_node = None
+            end_node = None
+            
+            if int_tree is not None:
+                # Find nearest intersection for start point
+                dist_start, idx_start = int_tree.query(start_pt)
+                if dist_start < config.intersection_snap_radius_m * 1.5:
+                    start_node = intersections[idx_start].node_id
+                
+                # Find nearest intersection for end point
+                dist_end, idx_end = int_tree.query(end_pt)
+                if dist_end < config.intersection_snap_radius_m * 1.5:
+                    end_node = intersections[idx_end].node_id
+            
+            proper_node_assignments.append((start_node, end_node))
+        
+        # Map original attributes to split segments
+        split_supports = []
+        split_altitudes = []
+        split_sources = []
+        
+        orig_id_to_idx = {sid: i for i, sid in enumerate(segment_ids)}
+        for sid in split_ids:
+            if sid in orig_id_to_idx:
+                orig_idx = orig_id_to_idx[sid]
+                split_supports.append(supports[orig_idx])
+                split_altitudes.append(altitudes[orig_idx])
+                split_sources.append(sources[orig_idx])
+            else:
+                split_supports.append(1.0)
+                split_altitudes.append(np.nan)
+                split_sources.append("unknown")
+        
+        # Step 3: Group overlapping segments
+        if config.enable_frechet_averaging:
+            print("    Grouping parallel segments for averaging...")
+            avg_config = SegmentAveragingConfig(
+                corridor_buffer_m=config.frechet_corridor_buffer_m,
+                heading_tolerance_deg=config.frechet_heading_tolerance_deg,
+                min_corridor_overlap=config.frechet_min_overlap,
+                resample_spacing_m=config.frechet_resample_spacing_m,
+                frechet_eccentricity_power=config.frechet_eccentricity_power,
+                z_separation_threshold_m=config.z_separation_threshold_m,
+            )
+            
+            grouper = SegmentGrouper(avg_config)
+            groups = grouper.group_segments(
+                geometries=split_geoms,
+                segment_ids=split_ids,
+                supports=split_supports,
+                altitudes=split_altitudes,
+                node_pairs=proper_node_assignments,
+            )
+            
+            n_groups = len(groups)
+            n_multi = sum(1 for g in groups if g["member_count"] > 1)
+            print(f"    Created {n_groups} groups ({n_multi} with multiple members)")
+            
+            # Step 4: Average each group
+            print("    Computing Fréchet-weighted averages...")
+            averaged = average_segment_groups(
+                geometries=split_geoms,
+                segment_ids=split_ids,
+                supports=split_supports,
+                groups=groups,
+                altitudes=split_altitudes,
+                source_types=split_sources,
+                config=avg_config,
+            )
+            print(f"    Averaged to {len(averaged)} segments")
+        else:
+            # No averaging - just use split segments directly
+            averaged = []
+            for i, (geom, sid) in enumerate(zip(split_geoms, split_ids)):
+                if geom is not None and not geom.is_empty:
+                    averaged.append({
+                        "geometry": geom,
+                        "weighted_support": split_supports[i],
+                        "member_count": 1,
+                        "altitude_mean": split_altitudes[i],
+                        "source": split_sources[i],
+                    })
+        
+        # Step 5: Build topology network
+        print("    Building topology network...")
+        topo_config = TopologyConfig(
+            snap_radius_m=config.intersection_snap_radius_m,
+            min_segment_length_m=config.min_centerline_length_m,
+        )
+        
+        topo_geoms = [r["geometry"] for r in averaged]
+        topo_supports = [r["weighted_support"] for r in averaged]
+        topo_alts = [r.get("altitude_mean", np.nan) for r in averaged]
+        topo_sources = [r.get("source", "unknown") for r in averaged]
+        
+        nodes, edges = build_topology(
+            geometries=topo_geoms,
+            supports=topo_supports,
+            altitudes=topo_alts,
+            sources=topo_sources,
+            config=topo_config,
+        )
+        print(f"    Built network: {len(nodes)} nodes, {len(edges)} edges")
+        
+        # Convert back to DataFrame
+        result_records = []
+        for edge in edges:
+            # Convert geometry back to WGS84
+            geom_wgs = shapely_transform(
+                lambda x, y: self.to_wgs.transform(x, y),
+                edge.geometry
+            )
+            
+            result_records.append({
+                "geometry": geom_wgs,
+                "length_m": edge.length_m,
+                "weighted_support": edge.support,
+                "altitude_mean": edge.altitude_mean,
+                "source": edge.source,
+                "from_node": edge.from_node,
+                "to_node": edge.to_node,
+                "z_level": edge.z_level,
+            })
+        
+        if not result_records:
+            print("    Warning: No segments after topology building, returning original")
+            return centerlines
+        
+        result_df = pd.DataFrame(result_records)
+        result_gdf = gpd.GeoDataFrame(result_df, geometry="geometry", crs="EPSG:4326")
+        
+        reduction = len(centerlines) - len(result_df)
+        print(f"    Topology deduplication: {len(centerlines)} -> {len(result_df)} ({reduction} removed)")
+        
+        return result_gdf
+
+    # ------------------------------------------------------------------
+    #  ROUNDABOUT ZONE CLEANUP
+    # ------------------------------------------------------------------
+    
+    def _suppress_roundabout_centerlines(
+        self,
+        centerlines: pd.DataFrame,
+        roundabouts: List[dict],
+    ) -> pd.DataFrame:
+        """
+        Remove centerlines that fall mostly inside detected roundabout zones.
+        
+        A centerline is suppressed if >70% of its length lies within the
+        buffered roundabout circle. This prevents the overlapping spoke/through
+        lines that the clustering creates from remaining after roundabout detection.
+        """
+        if not roundabouts or centerlines.empty:
+            return centerlines
+        
+        print("  Suppressing centerlines inside roundabout zones...")
+        
+        gdf = gpd.GeoDataFrame(centerlines, crs="EPSG:4326")
+        gdf = gdf.to_crs(self.crs_projected)
+        
+        # Build buffered roundabout zones (buffer = 1.3× radius to catch spoke lines)
+        ra_zones = []
+        for ra in roundabouts:
+            # Convert roundabout geometry to projected CRS
+            ra_geom_wgs = ra["geometry"]
+            coords_wgs = np.array(ra_geom_wgs.coords)
+            proj_x, proj_y = self.to_proj.transform(coords_wgs[:, 0], coords_wgs[:, 1])
+            ra_geom_proj = LineString(zip(proj_x, proj_y))
+            
+            # Compute centroid and buffer
+            centroid = ra_geom_proj.centroid
+            radius = ra.get("radius", 20.0)
+            buffer_radius = radius * 1.3 + 5.0  # Extra margin for spoke lines
+            zone = centroid.buffer(buffer_radius)
+            ra_zones.append({
+                "zone": zone,
+                "centroid": centroid,
+                "radius": radius,
+                "geom_proj": ra_geom_proj,
+            })
+        
+        from shapely.ops import unary_union
+        combined_zone = unary_union([z["zone"] for z in ra_zones])
+        
+        to_remove = set()
+        for i, row in gdf.iterrows():
+            geom = row.geometry
+            if not isinstance(geom, LineString) or geom.is_empty:
+                continue
+            
+            try:
+                inside = geom.intersection(combined_zone)
+                inside_ratio = inside.length / geom.length if geom.length > 0 else 0
+            except Exception:
+                continue
+            
+            if inside_ratio > 0.70:
+                to_remove.add(i)
+        
+        if to_remove:
+            keep_mask = [i not in to_remove for i in gdf.index]
+            gdf = gdf[keep_mask].reset_index(drop=True)
+        
+        # Convert back
+        gdf = gdf.to_crs("EPSG:4326")
+        
+        print(f"    Suppressed {len(to_remove)} centerlines inside roundabout zones")
+        return pd.DataFrame(gdf.drop(columns=["geometry"])).assign(geometry=gdf.geometry)
+    
+    def _stitch_to_roundabouts(
+        self,
+        centerlines: pd.DataFrame,
+        roundabouts: List[dict],
+    ) -> pd.DataFrame:
+        """
+        Extend approaching road centerlines to connect to roundabout circles.
+        
+        For each roundabout, find centerline endpoints that are close to
+        (but not on) the roundabout circle, and extend them to snap onto it.
+        """
+        if not roundabouts or centerlines.empty:
+            return centerlines
+        
+        print("  Stitching road endpoints to roundabout circles...")
+        
+        gdf = gpd.GeoDataFrame(centerlines, crs="EPSG:4326")
+        gdf = gdf.to_crs(self.crs_projected)
+        
+        snap_distance = 25.0  # Max distance to snap an endpoint to a roundabout
+        stitched_count = 0
+        
+        # Build projected roundabout geometries
+        ra_proj_list = []
+        for ra in roundabouts:
+            ra_geom_wgs = ra["geometry"]
+            coords_wgs = np.array(ra_geom_wgs.coords)
+            proj_x, proj_y = self.to_proj.transform(coords_wgs[:, 0], coords_wgs[:, 1])
+            ra_geom_proj = LineString(zip(proj_x, proj_y))
+            ra_proj_list.append({
+                "geom": ra_geom_proj,
+                "radius": ra.get("radius", 20.0),
+            })
+        
+        new_geoms = list(gdf.geometry)
+        
+        for i, geom in enumerate(new_geoms):
+            if not isinstance(geom, LineString) or geom.is_empty or len(geom.coords) < 2:
+                continue
+            
+            coords = list(geom.coords)
+            modified = False
+            
+            for ra_info in ra_proj_list:
+                ra_geom = ra_info["geom"]
+                
+                # Check start endpoint
+                start_pt = geom.coords[0]
+                start_dist = ra_geom.distance(Point(start_pt))
+                
+                if start_dist < snap_distance and start_dist > 2.0:
+                    # Snap to nearest point on roundabout circle
+                    from shapely.ops import nearest_points
+                    snap_pt = nearest_points(ra_geom, Point(start_pt))[0]
+                    coords[0] = (snap_pt.x, snap_pt.y) + coords[0][2:]
+                    modified = True
+                
+                # Check end endpoint
+                end_pt = geom.coords[-1]
+                end_dist = ra_geom.distance(Point(end_pt))
+                
+                if end_dist < snap_distance and end_dist > 2.0:
+                    from shapely.ops import nearest_points
+                    snap_pt = nearest_points(ra_geom, Point(end_pt))[0]
+                    coords[-1] = (snap_pt.x, snap_pt.y) + coords[-1][2:]
+                    modified = True
+            
+            if modified:
+                try:
+                    new_line = LineString(coords)
+                    if not new_line.is_empty and new_line.length > 0:
+                        new_geoms[i] = new_line
+                        stitched_count += 1
+                except Exception:
+                    pass
+        
+        gdf = gdf.copy()
+        gdf["geometry"] = new_geoms
+        gdf = gdf.to_crs("EPSG:4326")
+        
+        print(f"    Stitched {stitched_count} centerline endpoints to roundabouts")
         return pd.DataFrame(gdf.drop(columns=["geometry"])).assign(geometry=gdf.geometry)
     
     # ------------------------------------------------------------------
@@ -1127,21 +1747,29 @@ class KharitaCenterlineGenerator:
             print("  No valid traces found. Exiting.")
             return None
         
-        # Sample traces
-        xs, ys, headings, weights, trace_ranges, trace_meta = self._sample_traces()
+        # Sample traces (now includes altitude for Z-level handling at interchanges)
+        xs, ys, headings, weights, altitudes, trace_ranges, trace_meta = self._sample_traces()
         
         if len(xs) == 0:
             print("  No sample points generated. Exiting.")
             return None
         
-        # Cluster points
-        labels, nodes = self._kharita_clustering(xs, ys, headings, weights)
+        # Store trace point coordinates for curve-aware interpolation
+        self._trace_points_xy = np.column_stack([xs, ys])
+        self._trace_labels = None  # Will be set after clustering
+        
+        # Cluster points (with Z-level separation for bridge/overpass handling)
+        labels, nodes = self._kharita_clustering(xs, ys, headings, weights, altitudes)
         self.labels = labels
+        self._trace_labels = labels  # Store for curve interpolation
         self.nodes_df = nodes
         
         if nodes.empty:
             print("  No clusters created. Exiting.")
             return None
+        
+        # Pre-compute edge trace points for fast curve interpolation
+        self._precompute_edge_trace_points()
         
         # Build node coordinate lookup
         node_xy = {
@@ -1202,6 +1830,9 @@ class KharitaCenterlineGenerator:
         
         # Merge parallel overlapping centerlines (fixes curve clustering issue)
         centerlines = self._merge_parallel_centerlines(centerlines)
+        
+        # NEW: Apply intersection-based topology and Fréchet averaging
+        centerlines = self._topology_based_deduplication(centerlines)
         self.centerlines_df = centerlines
         
         # Detect roundabouts
@@ -1210,6 +1841,13 @@ class KharitaCenterlineGenerator:
         
         # Combine centerlines with roundabouts
         if roundabouts:
+            # CRITICAL FIX: suppress centerlines inside roundabout zones BEFORE combining
+            centerlines = self._suppress_roundabout_centerlines(centerlines, roundabouts)
+            
+            # Stitch approaching road endpoints to roundabout circles
+            centerlines = self._stitch_to_roundabouts(centerlines, roundabouts)
+            self.centerlines_df = centerlines
+            
             ra_df = pd.DataFrame(roundabouts)
             # Ensure roundabouts have required columns
             for col in ["node_path", "construction_percent_mean", "traffic_signal_count_mean", 

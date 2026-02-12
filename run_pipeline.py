@@ -1,15 +1,14 @@
 """
-HSGA Pipeline Runner — Deep-Flow Hybrid Pipeline (5 phases)
+HSGA Pipeline Runner — Deep-Flow Hybrid Pipeline (4 phases)
 
 Usage:
     python run_pipeline.py [--sample N] [--skip-phase1]
 
 Phases:
   1. Data Ingestion (VPD + HPD + Nav Streets)
-  2. KDE Skeletonization (direction-aware rasterization -> morphological skeleton)
-  3. Probe Recovery (Bresenham transition enhancement on HPD residuals)
-  4. Graph Merging (VPD + Probe skeleton dedup & snapping)
-  5. Geometry Optimization (B-spline smoothing, redundancy removal, stub pruning)
+  2. Kharita Centerline Generation (heading-aware clustering + roundabout detection)
+  3. Geometry Cleanup & Topology (Hausdorff parallel merge, Z-level resolution, smoothing, stub pruning)
+  4. Final Optimization (interchange cleanup, quality selection, export)
 """
 
 import os
@@ -72,21 +71,21 @@ def evaluate_phase(phase_name, output_path, nav_gdf, buffer_m=15.0):
 
 def main():
     parser = argparse.ArgumentParser(description="HSGA Deep-Flow Pipeline Runner")
-    parser.add_argument("--sample", type=int, default=10000,
-                        help="VPD sample size (default: 10000)")
+    parser.add_argument("--sample", type=int, default=20000,
+                        help="VPD sample size (default: 20000)")
     parser.add_argument("--skip-phase1", action="store_true",
                         help="Skip Phase 1 if outputs exist")
                         
-    # Phase 2 Parameters
-    parser.add_argument("--cluster-radius-m", type=float, default=10.0)
-    parser.add_argument("--heading-tolerance-deg", type=float, default=55.0)
+    # Phase 2 Parameters (AGGRESSIVE tuning for max recovery)
+    parser.add_argument("--cluster-radius-m", type=float, default=15.0)  # Was 10→12→15 for better clustering
+    parser.add_argument("--heading-tolerance-deg", type=float, default=65.0)  # Was 55→60→65
     parser.add_argument("--heading-distance-weight-m", type=float, default=0.18)
-    parser.add_argument("--min-edge-support", type=float, default=1.0)
+    parser.add_argument("--min-edge-support", type=float, default=0.3)  # Was 1.0→0.5→0.3 KEY for recovery
     parser.add_argument("--reverse-edge-ratio", type=float, default=0.2)
-    parser.add_argument("--sample-spacing-m", type=float, default=8.0)
-    parser.add_argument("--max-points-per-trace", type=int, default=120)
-    parser.add_argument("--candidate-selection-threshold", type=float, default=0.25)
-    parser.add_argument("--candidate-density-scale", type=float, default=0.15)
+    parser.add_argument("--sample-spacing-m", type=float, default=5.0)  # Was 8→6→5 for finer detail
+    parser.add_argument("--max-points-per-trace", type=int, default=150)  # Was 120→150
+    parser.add_argument("--candidate-selection-threshold", type=float, default=0.10)  # Was 0.25→0.18→0.10
+    parser.add_argument("--candidate-density-scale", type=float, default=0.08)  # Was 0.15→0.12→0.08
     parser.add_argument("--enable-dynamic-weighting", action="store_true", default=True)
     parser.add_argument("--dyn-lambda-vpd", type=float, default=1.6)
     parser.add_argument("--dyn-road-likeness-beta", type=float, default=6.0)
@@ -160,57 +159,40 @@ def main():
     m2 = evaluate_phase("Phase 2: Kharita Centerlines", skeleton_output, nav_gdf)
 
     # ─────────────────────────────────────────────────────────────
-    #  PHASE 3: Probe Recovery
+    #  PHASE 3: VPD Geometry Refinement
     # ─────────────────────────────────────────────────────────────
     print("\n" + "=" * 60)
-    probe_output = os.path.join(PROJECT_ROOT, "data", "interim_probe_skeleton_phase3.gpkg")
+    refined_output = os.path.join(PROJECT_ROOT, "data", "interim_refined_skeleton_phase3.gpkg")
 
-    from src.pipeline_phase3 import ProbeRecovery  # Now uses Roadster algorithm
+    from src.pipeline_phase3 import VPDGeometryRefiner  # Uses probe signal for refinement
 
-    recovery = ProbeRecovery(
+    refiner = VPDGeometryRefiner(
         skeleton_path=skeleton_output,
         hpd_path=hpd_output,
         output_dir=os.path.join(PROJECT_ROOT, "data"),
     )
-    recovery.run()
-    del recovery; gc.collect()
+    refiner.run()
+    del refiner; gc.collect()
 
-    m3 = evaluate_phase("Phase 3: Roadster Probe Recovery", probe_output, nav_gdf)
-
-    # ─────────────────────────────────────────────────────────────
-    #  PHASE 4: Graph Merging
-    # ─────────────────────────────────────────────────────────────
-    print("\n" + "=" * 60)
-    merged_output = os.path.join(PROJECT_ROOT, "data", "merged_network_phase4.gpkg")
-
-    from src.pipeline_phase4 import GraphMerger
-
-    merger = GraphMerger(
-        vpd_skeleton_path=skeleton_output,
-        probe_skeleton_path=probe_output,
-        output_dir=os.path.join(PROJECT_ROOT, "data"),
-    )
-    merger.run()
-    del merger; gc.collect()
-
-    m4 = evaluate_phase("Phase 4: Merged Network", merged_output, nav_gdf)
+    m3 = evaluate_phase("Phase 3: VPD Geometry Refinement", refined_output, nav_gdf)
 
     # ─────────────────────────────────────────────────────────────
-    #  PHASE 5: Geometry Optimization
+    #  PHASE 4: Final Optimization (formerly Phase 5)
     # ─────────────────────────────────────────────────────────────
     print("\n" + "=" * 60)
     final_output = os.path.join(PROJECT_ROOT, "data", "final_centerline_output_4326.gpkg")
 
-    from src.pipeline_phase5 import GeometryOptimizer
+    from src.pipeline_phase4 import GeometryOptimizer
 
+    # Phase 4 reads directly from Phase 3 (consolidated cleanup)
     optimizer = GeometryOptimizer(
-        merged_output,
+        refined_output,
         output_dir=os.path.join(PROJECT_ROOT, "data"),
     )
     optimizer.run()
     del optimizer; gc.collect()
 
-    m5 = evaluate_phase("Phase 5: Final Output", final_output, nav_gdf)
+    m4 = evaluate_phase("Phase 4: Final Output", final_output, nav_gdf)
 
     # ─────────────────────────────────────────────────────────────
     #  SUMMARY
@@ -228,9 +210,8 @@ def main():
     for label, m in [
         ("Phase 1: Raw VPD", m1),
         ("Phase 2: Kharita Centerlines", m2),
-        ("Phase 3: Roadster Probe Recovery", m3),
-        ("Phase 4: Merged Network", m4),
-        ("Phase 5: Final Output", m5),
+        ("Phase 3: Geometry Cleanup", m3),
+        ("Phase 4: Final Output", m4),
     ]:
         if m is not None:
             print(f"  {label:<35} {m['nav_recovery_pct']:>10.1f} {m['nav_precision_pct']:>10.1f} {m['num_lines']:>8}")

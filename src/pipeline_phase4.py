@@ -1,15 +1,14 @@
 """
-Phase 4: Graph Merging — Combine VPD + Probe Skeletons
+Phase 4: Final Geometry Optimization (formerly Phase 5)
 
-Merges the high-precision VPD skeleton (Phase 2) with the high-recall
-Probe skeleton (Phase 3) into a single network without degrading precision.
+Lightweight final pass — runs AFTER the consolidated Phase 3 cleanup.
+Only performs operations unique to this phase:
+  1. Interchange zone cleanup (cloverleaf/bridge knot removal)
+  2. Quality-based candidate selection (disabled by default)
+  3. Geometry cleaning + export (local CRS + WGS84)
 
-Algorithm:
-  1. Load both skeletons
-  2. Buffer deduplication: remove Probe edges already covered by VPD
-  3. Endpoint snapping via cKDTree + union-find
-  4. Line merge for collinear adjacent segments
-  5. Export combined network
+NOTE: Smoothing, parallel merge, stub pruning, and Z-level resolution
+are now consolidated in Phase 3 and NOT duplicated here.
 """
 
 import gc
@@ -17,362 +16,385 @@ import os
 import sys
 import time
 import warnings
-from collections import defaultdict
 
 import geopandas as gpd
 import numpy as np
 import pandas as pd
 from scipy.spatial import cKDTree
 from shapely import STRtree
-from shapely.geometry import LineString, MultiLineString, Point
-from shapely.ops import linemerge, nearest_points, snap, unary_union
+from shapely.geometry import LineString
 
 warnings.filterwarnings("ignore")
+
+# Import quality scoring module
+try:
+    from src.algorithms.quality_scoring import (
+        QualityConfig,
+        enhance_segments_with_quality,
+    )
+    QUALITY_SCORING_AVAILABLE = True
+except ImportError:
+    QUALITY_SCORING_AVAILABLE = False
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
-class GraphMerger:
+class GeometryOptimizer:
     """
-    Phase 4: Merge VPD skeleton + Probe skeleton into a unified network.
+    Phase 4 (formerly Phase 5): Lightweight final geometry optimization.
 
-    VPD skeleton is high-precision (kept as-is).
-    Probe skeleton fills gaps but may overlap — deduplication is critical.
+    Only performs operations that are unique to this phase:
+      1. Complex interchange zone cleanup
+      2. Quality-based candidate selection (optional)
+      3. Geometry cleaning & export
     """
 
     def __init__(
         self,
-        vpd_skeleton_path,
-        probe_skeleton_path,
-        output_dir="data",
-        dedup_buffer_m=10.0,      # tighter dedup zone to preserve parallel roads (was 18)
-        snap_dist_m=10.0,         # endpoint snapping distance
-        min_length_m=6.0,         # relaxed minimum (was 8)
-        probe_min_length_m=8.0,   # relaxed minimum for probe lines (was 12)
+        input_path: str,
+        output_dir: str = "data",
+        min_length: float = 4.0,
+        # Complex interchange handling
+        enable_interchange_cleanup: bool = True,
+        interchange_density_threshold: int = 5,
+        interchange_zone_radius_m: float = 50.0,
+        interchange_min_length_m: float = 15.0,
+        interchange_crossing_angle_deg: float = 30.0,
+        # Quality-based candidate selection (disabled by default)
+        enable_quality_selection: bool = False,
+        quality_selection_threshold: float = 0.30,
+        quality_force_keep_support: float = 6.0,
+        quality_dangling_max_length_m: float = 35.0,
+        quality_dangling_min_support: float = 6.0,
     ):
-        self.vpd_skeleton_path = vpd_skeleton_path
-        self.probe_skeleton_path = probe_skeleton_path
+        self.input_path = input_path
         self.output_dir = output_dir
-        self.dedup_buffer_m = dedup_buffer_m
-        self.snap_dist_m = snap_dist_m
-        self.min_length_m = min_length_m
-        self.probe_min_length_m = probe_min_length_m
+        self.min_length = min_length
 
+        # Interchange cleanup params
+        self.enable_interchange_cleanup = enable_interchange_cleanup
+        self.interchange_density_threshold = interchange_density_threshold
+        self.interchange_zone_radius_m = interchange_zone_radius_m
+        self.interchange_min_length_m = interchange_min_length_m
+        self.interchange_crossing_angle_deg = interchange_crossing_angle_deg
+
+        # Quality selection params
+        self.enable_quality_selection = enable_quality_selection
+        self.quality_selection_threshold = quality_selection_threshold
+        self.quality_force_keep_support = quality_force_keep_support
+        self.quality_dangling_max_length_m = quality_dangling_max_length_m
+        self.quality_dangling_min_support = quality_dangling_min_support
+
+        self.gdf = None
         self.local_crs = None
-        self.vpd_skel = None
-        self.probe_skel = None
-        self.merged_gdf = None
+        self.final_gdf = None
 
     # ──────────────────────────────────────────────────────────────────
     #  DATA LOADING
     # ──────────────────────────────────────────────────────────────────
 
     def load_data(self):
-        print("  Loading VPD and Probe skeletons...")
+        print("  Loading refined skeleton...")
+        if not os.path.exists(self.input_path):
+            raise FileNotFoundError(f"Input not found: {self.input_path}")
 
-        # VPD skeleton
-        self.vpd_skel = gpd.read_file(self.vpd_skeleton_path)
-        if self.vpd_skel.crs is None or self.vpd_skel.crs.is_geographic:
-            bounds = self.vpd_skel.total_bounds
+        self.gdf = gpd.read_file(self.input_path)
+
+        if self.gdf.crs is None or self.gdf.crs.is_geographic:
+            bounds = self.gdf.total_bounds
             cx = (bounds[0] + bounds[2]) / 2.0
             cy = (bounds[1] + bounds[3]) / 2.0
             self.local_crs = (
                 f"+proj=aeqd +lat_0={cy} +lon_0={cx} "
                 f"+x_0=0 +y_0=0 +ellps=WGS84 +datum=WGS84 +units=m +no_defs"
             )
-            self.vpd_skel = self.vpd_skel.to_crs(self.local_crs)
+            self.gdf = self.gdf.to_crs(self.local_crs)
         else:
-            self.local_crs = self.vpd_skel.crs
+            self.local_crs = self.gdf.crs
 
-        # Filter valid geometries
-        self.vpd_skel = self.vpd_skel[
-            self.vpd_skel.geometry.notna()
-            & ~self.vpd_skel.geometry.is_empty
+        # Explode MultiLineStrings
+        self.gdf = self.gdf.explode(index_parts=False).reset_index(drop=True)
+
+        # Filter valid
+        self.gdf = self.gdf[
+            self.gdf.geometry.notna()
+            & ~self.gdf.geometry.is_empty
+            & (self.gdf.geom_type == "LineString")
         ].reset_index(drop=True)
 
-        print(f"    VPD skeleton: {len(self.vpd_skel)} segments")
-
-        # Probe skeleton
-        if os.path.exists(self.probe_skeleton_path):
-            self.probe_skel = gpd.read_file(self.probe_skeleton_path)
-            if len(self.probe_skel) > 0:
-                self.probe_skel = self.probe_skel.to_crs(self.local_crs)
-                self.probe_skel = self.probe_skel[
-                    self.probe_skel.geometry.notna()
-                    & ~self.probe_skel.geometry.is_empty
-                ].reset_index(drop=True)
-            print(f"    Probe skeleton: {len(self.probe_skel)} segments")
-        else:
-            print(f"    Probe skeleton not found at {self.probe_skeleton_path}")
-            self.probe_skel = gpd.GeoDataFrame(columns=["geometry"], crs=self.local_crs)
+        print(f"    Loaded {len(self.gdf)} line segments")
 
     # ──────────────────────────────────────────────────────────────────
-    #  BUFFER DEDUPLICATION
+    #  COMPLEX INTERCHANGE CLEANUP
     # ──────────────────────────────────────────────────────────────────
 
-    def deduplicate_probes(self):
+    def cleanup_interchange_zones(self):
         """
-        Remove probe segments that fall entirely within the VPD buffer.
-        A probe segment is kept only if a significant portion lies
-        outside the VPD coverage zone.
+        Detect and clean up complex interchange zones (cloverleafs, bridges).
+
+        At these locations, GPS noise causes a "central knot" where lines
+        from different road levels get mashed together.
+
+        Strategy:
+          1. Detect high-density zones where many lines cross
+          2. Remove short "crossing connector" segments that jump between flows
+          3. Preserve main through-routes based on length and consistency
         """
-        if len(self.probe_skel) == 0:
-            print("  No probe segments to deduplicate.")
+        if not self.enable_interchange_cleanup:
             return
 
-        print(f"  Deduplicating probes (removing within {self.dedup_buffer_m}m of VPD)...")
-        before = len(self.probe_skel)
+        print("  Cleaning up complex interchange zones...")
+        before_count = len(self.gdf)
 
-        # Build VPD buffer
-        vpd_buffered = self.vpd_skel.geometry.buffer(self.dedup_buffer_m)
-        vpd_buf_union = unary_union(vpd_buffered.values)
+        if before_count < 5:
+            return
 
-        # For each probe segment, compute what fraction lies within VPD buffer
-        keep_mask = []
-        for geom in self.probe_skel.geometry:
-            try:
-                inside = geom.intersection(vpd_buf_union)
-                frac_inside = inside.length / geom.length if geom.length > 0 else 1.0
-                # Keep if >40% is outside the VPD buffer (relaxed from 50%)
-                # AND the segment is long enough to be a real road
-                keep = (frac_inside < 0.6) and (geom.length >= self.probe_min_length_m)
-                keep_mask.append(keep)
-            except Exception:
-                keep_mask.append(False)  # on error, discard probe (conservative)
+        # Find potential interchange centroids (high line density)
+        geoms = self.gdf.geometry.values
 
-        self.probe_skel = self.probe_skel[keep_mask].reset_index(drop=True)
-        removed = before - len(self.probe_skel)
-        print(f"    Dedup: {before} -> {len(self.probe_skel)} probe segments "
-              f"({removed} removed as VPD-covered)")
+        # Collect line midpoints for density analysis
+        midpoints = []
+        for geom in geoms:
+            if isinstance(geom, LineString) and len(geom.coords) >= 2:
+                mid = geom.interpolate(0.5, normalized=True)
+                midpoints.append((mid.x, mid.y))
 
-        del vpd_buf_union, vpd_buffered
-        gc.collect()
+        if len(midpoints) < 5:
+            return
 
-    # ──────────────────────────────────────────────────────────────────
-    #  ENDPOINT SNAPPING
-    # ──────────────────────────────────────────────────────────────────
+        midpoints_arr = np.array(midpoints)
+        mid_tree = cKDTree(midpoints_arr)
 
-    def snap_endpoints(self, lines):
-        """
-        Snap nearby endpoints together using cKDTree + union-find.
-        This ensures connectivity at junctions.
-        
-        Returns list of same length as input - invalid geometries become None.
-        """
-        if len(lines) < 2:
-            return lines
+        # Find dense clusters that indicate interchange zones
+        interchange_zones = []
+        checked: set = set()
 
-        print(f"  Snapping endpoints (within {self.snap_dist_m}m)...")
-
-        # Collect all endpoints
-        all_ends = []
-        for line in lines:
-            cs = list(line.coords)
-            all_ends.append(cs[0])
-            all_ends.append(cs[-1])
-
-        coords_arr = np.array(all_ends, dtype=np.float64)
-        kd = cKDTree(coords_arr)
-        pairs = kd.query_pairs(self.snap_dist_m)
-
-        if not pairs:
-            print("    No endpoints to snap.")
-            return lines
-
-        # Union-find
-        parent = list(range(len(all_ends)))
-
-        def find(i):
-            while parent[i] != i:
-                parent[i] = parent[parent[i]]
-                i = parent[i]
-            return i
-
-        for a, b in pairs:
-            ra, rb = find(a), find(b)
-            if ra != rb:
-                parent[ra] = rb
-
-        clusters = defaultdict(list)
-        for i in range(len(all_ends)):
-            clusters[find(i)].append(i)
-
-        snap_map = {}
-        for members in clusters.values():
-            if len(members) < 2:
+        for i, (mx, my) in enumerate(midpoints):
+            if i in checked:
                 continue
-            cx = np.mean([coords_arr[m][0] for m in members])
-            cy = np.mean([coords_arr[m][1] for m in members])
-            for m in members:
-                snap_map[m] = (cx, cy)
 
-        # Return same length as input - None for invalid geometries
-        snapped = []
-        for li, line in enumerate(lines):
-            coords = list(line.coords)
-            si, ei = li * 2, li * 2 + 1
-            if si in snap_map:
-                coords[0] = snap_map[si]
-            if ei in snap_map:
-                coords[-1] = snap_map[ei]
-            new_line = LineString(coords)
-            if not new_line.is_empty and new_line.length > 0:
-                snapped.append(new_line)
-            else:
-                snapped.append(None)  # Preserve index alignment
-
-        n_snapped = len(snap_map)
-        print(f"    Snapped {n_snapped} endpoints across {len(clusters)} groups")
-        return snapped
-
-    # ──────────────────────────────────────────────────────────────────
-    #  MERGE + CLEAN
-    # ──────────────────────────────────────────────────────────────────
-
-    def merge_networks(self):
-        """
-        Combine VPD + deduplicated Probe segments while preserving attributes.
-        
-        Unlike the old version, we do NOT use linemerge (which destroys attributes).
-        Instead, we concatenate GeoDataFrames and preserve support data.
-        """
-        print("  Merging VPD + Probe networks (attribute-preserving)...")
-
-        # Prepare VPD with default high support
-        vpd_records = []
-        for idx, row in self.vpd_skel.iterrows():
-            geom = row.geometry
-            geoms_to_add = []
-            if isinstance(geom, MultiLineString):
-                geoms_to_add = list(geom.geoms)
-            elif isinstance(geom, LineString):
-                geoms_to_add = [geom]
-            
-            for g in geoms_to_add:
-                vpd_records.append({
-                    "geometry": g,
-                    "source": "VPD",
-                    "weighted_support": 50.0,  # VPD segments get high default support
-                    "heading_consistency": 0.9,
-                    "cluster_members": 10,
-                })
-        
-        # Prepare Probe with support from Phase 3 output
-        probe_records = []
-        for idx, row in self.probe_skel.iterrows():
-            geom = row.geometry
-            geoms_to_add = []
-            if isinstance(geom, MultiLineString):
-                geoms_to_add = list(geom.geoms)
-            elif isinstance(geom, LineString):
-                geoms_to_add = [geom]
-            
-            # Get support data if available (from Phase 3)
-            weighted_support = row.get("weighted_support", 3.0) if hasattr(row, "get") else getattr(row, "weighted_support", 3.0)
-            heading_consistency = row.get("heading_consistency", 0.5) if hasattr(row, "get") else getattr(row, "heading_consistency", 0.5)
-            cluster_members = row.get("cluster_members", 2) if hasattr(row, "get") else getattr(row, "cluster_members", 2)
-            
-            for g in geoms_to_add:
-                probe_records.append({
-                    "geometry": g,
-                    "source": "Probe",
-                    "weighted_support": float(weighted_support) if weighted_support is not None else 3.0,
-                    "heading_consistency": float(heading_consistency) if heading_consistency is not None else 0.5,
-                    "cluster_members": int(cluster_members) if cluster_members is not None else 2,
-                })
-        
-        print(f"    Combined: {len(vpd_records)} VPD + {len(probe_records)} Probe = {len(vpd_records) + len(probe_records)} total")
-
-        # Create combined GeoDataFrame
-        all_records = vpd_records + probe_records
-        if not all_records:
-            self.merged_gdf = gpd.GeoDataFrame(
-                columns=["geometry", "source", "weighted_support", "heading_consistency", "cluster_members"],
-                crs=self.local_crs
+            nearby_idx = mid_tree.query_ball_point(
+                [mx, my], r=self.interchange_zone_radius_m
             )
-            return self.merged_gdf
-        
-        combined_gdf = gpd.GeoDataFrame(all_records, crs=self.local_crs)
-        
-        # Filter short segments (different thresholds for VPD vs Probe)
-        keep_mask = []
-        for idx, row in combined_gdf.iterrows():
-            if row["source"] == "VPD":
-                keep_mask.append(row.geometry.length >= self.min_length_m)
-            else:
-                keep_mask.append(row.geometry.length >= self.probe_min_length_m)
-        
-        combined_gdf = combined_gdf[keep_mask].reset_index(drop=True)
-        print(f"    After length filter: {len(combined_gdf)} segments")
 
-        # Snap endpoints - need to preserve attribute alignment
-        # First snap all geometries
-        original_geoms = list(combined_gdf.geometry)
-        snapped_geoms = self.snap_endpoints(original_geoms)
-        
-        # Build new records keeping only valid snapped geometries
-        valid_records = []
-        for i, geom in enumerate(snapped_geoms):
-            if geom is not None and not geom.is_empty and geom.length > 0:
-                row = combined_gdf.iloc[i].to_dict()
-                row["geometry"] = geom
-                valid_records.append(row)
-        
-        if valid_records:
-            combined_gdf = gpd.GeoDataFrame(valid_records, crs=self.local_crs)
+            if len(nearby_idx) >= self.interchange_density_threshold:
+                zone_x = np.mean([midpoints[j][0] for j in nearby_idx])
+                zone_y = np.mean([midpoints[j][1] for j in nearby_idx])
+                interchange_zones.append({
+                    "center_x": zone_x,
+                    "center_y": zone_y,
+                    "line_indices": nearby_idx,
+                    "density": len(nearby_idx),
+                })
+                for j in nearby_idx:
+                    checked.add(j)
+
+        if not interchange_zones:
+            print("    No complex interchange zones detected")
+            return
+
+        print(f"    Detected {len(interchange_zones)} interchange zones")
+
+        # Analyze lines in each interchange zone
+        to_remove: set = set()
+
+        for zone in interchange_zones:
+            zone_indices = zone["line_indices"]
+            zone_cx, zone_cy = zone["center_x"], zone["center_y"]
+
+            zone_lines = []
+            for idx in zone_indices:
+                if idx >= len(self.gdf):
+                    continue
+
+                row = self.gdf.iloc[idx]
+                geom = row.geometry
+                if not isinstance(geom, LineString) or len(geom.coords) < 2:
+                    continue
+
+                coords = np.array(geom.coords)
+                dx = coords[-1, 0] - coords[0, 0]
+                dy = coords[-1, 1] - coords[0, 1]
+                heading = np.degrees(np.arctan2(dy, dx)) % 180.0
+
+                zone_lines.append({
+                    "idx": idx,
+                    "length": geom.length,
+                    "heading": heading,
+                    "source": row.get("source", "VPD") if "source" in row.index else "VPD",
+                })
+
+            if len(zone_lines) < 3:
+                continue
+
+            # Group lines by heading
+            heading_groups: dict = {}
+            for line_info in zone_lines:
+                h = line_info["heading"]
+                assigned = False
+                for gh, group in heading_groups.items():
+                    hdiff = abs(h - gh)
+                    hdiff = min(hdiff, 180 - hdiff)
+                    if hdiff <= self.interchange_crossing_angle_deg:
+                        group.append(line_info)
+                        assigned = True
+                        break
+                if not assigned:
+                    heading_groups[h] = [line_info]
+
+            # Main flows have multiple consistent-heading lines
+            main_flow_headings = {
+                gh for gh, group in heading_groups.items() if len(group) >= 2
+            }
+
+            for line_info in zone_lines:
+                h = line_info["heading"]
+                is_main_flow = False
+                for mfh in main_flow_headings:
+                    hdiff = abs(h - mfh)
+                    hdiff = min(hdiff, 180 - hdiff)
+                    if hdiff <= self.interchange_crossing_angle_deg:
+                        is_main_flow = True
+                        break
+
+                # Remove short non-main-flow lines (noise/connectors)
+                if not is_main_flow and line_info["length"] < self.interchange_min_length_m:
+                    to_remove.add(line_info["idx"])
+                elif line_info["length"] < self.interchange_min_length_m * 0.5:
+                    to_remove.add(line_info["idx"])
+
+        if to_remove:
+            keep_mask = [i not in to_remove for i in range(len(self.gdf))]
+            self.gdf = self.gdf[keep_mask].reset_index(drop=True)
+
+        removed = before_count - len(self.gdf)
+        print(f"    Removed {removed} interchange noise segments ({len(self.gdf)} remaining)")
+
+    # ──────────────────────────────────────────────────────────────────
+    #  QUALITY-BASED CANDIDATE SELECTION
+    # ──────────────────────────────────────────────────────────────────
+
+    def apply_quality_selection(self):
+        """
+        Apply quality-based candidate selection to filter weak segments.
+        Currently disabled by default — kept for tuning.
+        """
+        if not self.enable_quality_selection:
+            print("  Quality selection: DISABLED (skipping)")
+            return
+
+        if not QUALITY_SCORING_AVAILABLE:
+            print("  Quality scoring module not available, skipping...")
+            return
+
+        print("  Applying quality-based candidate selection...")
+        before = len(self.gdf)
+
+        config = QualityConfig(
+            candidate_selection_enabled=True,
+            candidate_selection_threshold=self.quality_selection_threshold,
+            candidate_force_keep_support=self.quality_force_keep_support,
+            candidate_dangling_max_length_m=self.quality_dangling_max_length_m,
+            candidate_dangling_min_support=self.quality_dangling_min_support,
+            candidate_short_length_m=10.0,
+            candidate_low_support=4.0,
+            candidate_length_scale_m=70.0,
+        )
+
+        scored_gdf = enhance_segments_with_quality(self.gdf, config)
+
+        if "is_candidate" in scored_gdf.columns:
+            has_source = "source" in scored_gdf.columns
+            if has_source:
+                keep_mask = (
+                    scored_gdf["is_candidate"]
+                    | (scored_gdf["source"] == "VPD")
+                    | (scored_gdf["source"] == "roundabout")
+                )
+            else:
+                keep_mask = scored_gdf["is_candidate"]
+
+            self.gdf = scored_gdf[keep_mask].reset_index(drop=True)
         else:
-            combined_gdf = gpd.GeoDataFrame(
-                columns=["geometry", "source", "weighted_support", "heading_consistency", "cluster_members"],
-                crs=self.local_crs
-            )
-        
-        print(f"    After snapping: {len(combined_gdf)} segments")
-        
-        # Log support stats
-        probe_mask = combined_gdf["source"] == "Probe"
-        if probe_mask.any():
-            probe_support = combined_gdf.loc[probe_mask, "weighted_support"]
-            print(f"    Probe support stats: min={probe_support.min():.1f}, "
-                  f"max={probe_support.max():.1f}, mean={probe_support.mean():.1f}")
+            self.gdf = scored_gdf
 
-        self.merged_gdf = combined_gdf
-        return self.merged_gdf
+        removed = before - len(self.gdf)
+        print(f"    Quality selection: {before} -> {len(self.gdf)} ({removed} removed)")
 
     # ──────────────────────────────────────────────────────────────────
-    #  EXPORT / MAIN PIPELINE
+    #  CLEANING + EXPORT
+    # ──────────────────────────────────────────────────────────────────
+
+    def clean_geometries(self):
+        """Fix invalid geometries, remove short/empty segments."""
+        print("  Cleaning geometries...")
+        before = len(self.gdf)
+
+        self.gdf = self.gdf[~self.gdf.geometry.is_empty].copy()
+
+        invalid_mask = ~self.gdf.geometry.is_valid
+        if invalid_mask.sum() > 0:
+            self.gdf.loc[invalid_mask, "geometry"] = (
+                self.gdf.loc[invalid_mask, "geometry"].buffer(0)
+            )
+
+        self.gdf = self.gdf[
+            self.gdf.geom_type.isin(["LineString", "MultiLineString"])
+        ].copy()
+
+        self.gdf = self.gdf[self.gdf.geometry.length >= self.min_length].copy()
+        self.gdf = self.gdf.reset_index(drop=True)
+
+        print(f"    Cleaned: {before} -> {len(self.gdf)} segments")
+
+    def export(self):
+        self.clean_geometries()
+        self.final_gdf = self.gdf.copy()
+
+        output_path = os.path.join(self.output_dir, "final_centerline_output.gpkg")
+        print(f"  Exporting to {output_path}...")
+
+        self.final_gdf.to_file(output_path, driver="GPKG")
+
+        output_4326 = output_path.replace(".gpkg", "_4326.gpkg")
+        gdf_4326 = self.final_gdf.to_crs("EPSG:4326")
+        gdf_4326.to_file(output_4326, driver="GPKG")
+        print(f"  Exported: {len(self.final_gdf)} segments")
+        print(f"    Local CRS: {output_path}")
+        print(f"    WGS84:     {output_4326}")
+
+    # ──────────────────────────────────────────────────────────────────
+    #  MAIN PIPELINE
     # ──────────────────────────────────────────────────────────────────
 
     def run(self):
         print("=" * 60)
-        print("  PHASE 4: Graph Merging (VPD + Probe)")
+        print("  PHASE 4: Final Geometry Optimization")
         print("=" * 60)
         t0 = time.time()
 
         self.load_data()
-        self.deduplicate_probes()
-        self.merge_networks()
 
-        # Export
-        output_path = os.path.join(self.output_dir, "merged_network_phase4.gpkg")
-        print(f"  Exporting to {output_path}...")
-        out_gdf = self.merged_gdf.to_crs("EPSG:4326")
-        out_gdf.to_file(output_path, driver="GPKG")
+        # Interchange zone cleanup (unique to this phase)
+        self.cleanup_interchange_zones()
+
+        # Quality selection (disabled by default, kept for tuning)
+        self.apply_quality_selection()
+
+        # Export (includes clean_geometries)
+        self.export()
 
         elapsed = time.time() - t0
-        total_km = self.merged_gdf.geometry.length.sum() / 1000.0
-        n_vpd = (self.merged_gdf["source"] == "VPD").sum()
-        n_probe = (self.merged_gdf["source"] == "Probe").sum()
-
+        total_km = self.final_gdf.geometry.length.sum() / 1000.0
         print(f"\nPhase 4 complete in {elapsed:.1f}s")
-        print(f"  Merged network: {len(self.merged_gdf)} segments ({total_km:.1f} km)")
-        print(f"    VPD: {n_vpd}, Probe: {n_probe}")
+        print(f"  Final network: {len(self.final_gdf)} segments, {total_km:.1f} km")
 
-        return self.merged_gdf
+        return self.final_gdf
 
 
 if __name__ == "__main__":
-    VPD_SKEL = os.path.join(PROJECT_ROOT, "data", "interim_skeleton_phase2.gpkg")
-    PROBE_SKEL = os.path.join(PROJECT_ROOT, "data", "interim_probe_skeleton_phase3.gpkg")
-
-    merger = GraphMerger(VPD_SKEL, PROBE_SKEL)
-    merger.run()
+    INPUT_FILE = os.path.join(
+        PROJECT_ROOT, "data", "interim_refined_skeleton_phase3.gpkg"
+    )
+    optimizer = GeometryOptimizer(INPUT_FILE)
+    optimizer.run()

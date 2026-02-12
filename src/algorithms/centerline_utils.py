@@ -386,45 +386,59 @@ def resample_polyline(coords: np.ndarray, n_points: int) -> np.ndarray:
     return np.column_stack([x, y])
 
 
-def discrete_frechet_distance(a: np.ndarray, b: np.ndarray) -> float:
+def discrete_frechet_distance(a: np.ndarray, b: np.ndarray, threshold: float = float("inf")) -> float:
     """
     Compute discrete Fréchet distance between two 2D polylines.
     
-    Fréchet distance measures the maximum deviation between two curves,
-    considering the order of points ("walking the dog" metaphor).
+    Uses iterative DP with optional early termination when the distance
+    exceeds a threshold, avoiding expensive full computation.
     
     Args:
         a: First polyline as (N, 2) array
         b: Second polyline as (M, 2) array
+        threshold: Early exit if distance exceeds this value
         
     Returns:
-        Fréchet distance value
+        Fréchet distance value (or value > threshold if exceeded)
     """
     if len(a) == 0 or len(b) == 0:
         return float("inf")
     
-    # Dynamic programming table
-    ca = np.full((len(a), len(b)), -1.0, dtype=np.float64)
-
-    def rec(i: int, j: int) -> float:
-        if ca[i, j] >= 0.0:
-            return float(ca[i, j])
-        
-        dij = float(np.hypot(a[i, 0] - b[j, 0], a[i, 1] - b[j, 1]))
-        
-        if i == 0 and j == 0:
-            v = dij
-        elif i > 0 and j == 0:
-            v = max(rec(i - 1, 0), dij)
-        elif i == 0 and j > 0:
-            v = max(rec(0, j - 1), dij)
-        else:
-            v = max(min(rec(i - 1, j), rec(i - 1, j - 1), rec(i, j - 1)), dij)
-        
-        ca[i, j] = v
-        return v
-
-    return rec(len(a) - 1, len(b) - 1)
+    na, nb = len(a), len(b)
+    
+    # Precompute all pairwise distances at once (vectorized)
+    dx = a[:, 0:1] - b[:, 0]  # (na, nb)
+    dy = a[:, 1:2] - b[:, 1]  # (na, nb)
+    dist = np.sqrt(dx * dx + dy * dy)
+    
+    # Iterative DP (much faster than recursive Python calls)
+    ca = np.empty((na, nb), dtype=np.float64)
+    
+    # Base case
+    ca[0, 0] = dist[0, 0]
+    
+    # First column
+    for i in range(1, na):
+        ca[i, 0] = max(ca[i - 1, 0], dist[i, 0])
+    
+    # First row
+    for j in range(1, nb):
+        ca[0, j] = max(ca[0, j - 1], dist[0, j])
+    
+    # Fill rest of DP table with early termination
+    for i in range(1, na):
+        row_min = float("inf")
+        for j in range(1, nb):
+            v = max(min(ca[i - 1, j], ca[i - 1, j - 1], ca[i, j - 1]), dist[i, j])
+            ca[i, j] = v
+            if v < row_min:
+                row_min = v
+        # If the minimum possible value in this row already exceeds threshold,
+        # the final answer will too — early exit
+        if row_min > threshold:
+            return row_min
+    
+    return float(ca[na - 1, nb - 1])
 
 
 def weighted_median(values: np.ndarray, weights: np.ndarray) -> float:
@@ -452,3 +466,255 @@ def weighted_median(values: np.ndarray, weights: np.ndarray) -> float:
     idx = max(0, min(idx, len(vals) - 1))
     
     return float(vals[idx])
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  CURVE-AWARE CENTERLINE GENERATION - Fixes for Cloverleaf Interchanges
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def interpolate_edge_with_traces(
+    start_xy: Tuple[float, float],
+    end_xy: Tuple[float, float],
+    trace_points: List[Tuple[float, float]],
+    edge_length_m: float,
+    min_intermediate_points: int = 2,
+    max_deviation_m: float = 5.0,
+) -> List[Tuple[float, float]]:
+    """
+    Interpolate intermediate points along an edge using nearby trace points.
+    
+    This fixes the "cutting chords" problem on curves by using actual trace
+    point positions instead of just connecting cluster centroids.
+    
+    Args:
+        start_xy: Start point (x, y)
+        end_xy: End point (x, y)
+        trace_points: List of (x, y) trace points that contributed to this edge
+        edge_length_m: Length of the edge in meters
+        min_intermediate_points: Minimum number of intermediate points to add
+        max_deviation_m: Max distance from straight line to consider curve
+        
+    Returns:
+        List of (x, y) coordinates forming the interpolated edge
+    """
+    if len(trace_points) < 3:
+        return [start_xy, end_xy]
+    
+    # Sort trace points along the edge direction
+    edge_vec = np.array([end_xy[0] - start_xy[0], end_xy[1] - start_xy[1]])
+    edge_len = np.linalg.norm(edge_vec)
+    
+    if edge_len < 1.0:
+        return [start_xy, end_xy]
+    
+    edge_unit = edge_vec / edge_len
+    edge_perp = np.array([-edge_unit[1], edge_unit[0]])
+    
+    # Project trace points onto edge and compute perpendicular distance
+    projected = []
+    for px, py in trace_points:
+        pt = np.array([px - start_xy[0], py - start_xy[1]])
+        along = float(np.dot(pt, edge_unit))
+        perp_dist = float(np.dot(pt, edge_perp))
+        
+        # Only consider points within the edge span and not too far from line
+        if 0.05 * edge_len <= along <= 0.95 * edge_len:
+            projected.append((along, perp_dist, px, py))
+    
+    if len(projected) < 2:
+        return [start_xy, end_xy]
+    
+    # Sort by position along edge
+    projected.sort(key=lambda x: x[0])
+    
+    # Check if there's significant curvature (deviation from straight line)
+    perp_dists = [p[1] for p in projected]
+    max_dev = max(abs(min(perp_dists)), abs(max(perp_dists)))
+    
+    if max_dev < max_deviation_m:
+        # Straight edge, no interpolation needed
+        return [start_xy, end_xy]
+    
+    # Build interpolated path using binned trace positions
+    n_bins = max(min_intermediate_points, int(edge_length_m / 15.0))  # ~15m per bin
+    n_bins = min(n_bins, 10)  # Cap at 10 intermediate points
+    
+    bin_edges = np.linspace(0, edge_len, n_bins + 2)
+    bin_points = [[] for _ in range(n_bins)]
+    
+    for along, perp, px, py in projected:
+        bin_idx = min(int(along / edge_len * n_bins), n_bins - 1)
+        bin_points[bin_idx].append((px, py))
+    
+    # Build interpolated path
+    result = [start_xy]
+    
+    for bin_idx in range(n_bins):
+        if bin_points[bin_idx]:
+            # Use median position of points in this bin
+            xs = [p[0] for p in bin_points[bin_idx]]
+            ys = [p[1] for p in bin_points[bin_idx]]
+            median_x = float(np.median(xs))
+            median_y = float(np.median(ys))
+            result.append((median_x, median_y))
+        else:
+            # No points in bin, interpolate linearly
+            t = (bin_idx + 0.5) / n_bins
+            interp_x = start_xy[0] + t * edge_vec[0]
+            interp_y = start_xy[1] + t * edge_vec[1]
+            result.append((interp_x, interp_y))
+    
+    result.append(end_xy)
+    return result
+
+
+def compute_curvature_at_point(
+    prev_xy: Tuple[float, float],
+    curr_xy: Tuple[float, float],
+    next_xy: Tuple[float, float],
+) -> float:
+    """
+    Compute curvature at a point using Menger curvature formula.
+    
+    Returns curvature in 1/meters (inverse of radius).
+    """
+    ax, ay = prev_xy
+    bx, by = curr_xy
+    cx, cy = next_xy
+    
+    # Side lengths
+    a = math.sqrt((bx - cx)**2 + (by - cy)**2)  # BC
+    b = math.sqrt((ax - cx)**2 + (ay - cy)**2)  # AC
+    c = math.sqrt((ax - bx)**2 + (ay - by)**2)  # AB
+    
+    if a < 0.1 or b < 0.1 or c < 0.1:
+        return 0.0
+    
+    # Semi-perimeter and area
+    s = (a + b + c) / 2.0
+    area_sq = s * (s - a) * (s - b) * (s - c)
+    
+    if area_sq <= 0:
+        return 0.0
+    
+    area = math.sqrt(area_sq)
+    
+    # Menger curvature: k = 4 * Area / (a * b * c)
+    curvature = 4.0 * area / (a * b * c)
+    return curvature
+
+
+def detect_high_curvature_zones(
+    coords: np.ndarray,
+    curvature_threshold: float = 0.02,  # 1/50m = cloverleaf ramp radius
+    min_zone_length: int = 3,
+) -> List[Tuple[int, int]]:
+    """
+    Detect zones of high curvature in a polyline.
+    
+    Used to identify sections that need careful handling (like cloverleaf ramps).
+    
+    Args:
+        coords: Array of (x, y) coordinates
+        curvature_threshold: Minimum curvature to consider "high" (1/radius)
+        min_zone_length: Minimum consecutive high-curvature points
+        
+    Returns:
+        List of (start_idx, end_idx) tuples for high-curvature zones
+    """
+    if len(coords) < 3:
+        return []
+    
+    # Compute curvature at each interior point
+    curvatures = np.zeros(len(coords))
+    for i in range(1, len(coords) - 1):
+        curvatures[i] = compute_curvature_at_point(
+            tuple(coords[i-1]),
+            tuple(coords[i]),
+            tuple(coords[i+1])
+        )
+    
+    # Find zones where curvature exceeds threshold
+    high_curv = curvatures > curvature_threshold
+    zones = []
+    in_zone = False
+    zone_start = 0
+    
+    for i, is_high in enumerate(high_curv):
+        if is_high and not in_zone:
+            zone_start = i
+            in_zone = True
+        elif not is_high and in_zone:
+            if i - zone_start >= min_zone_length:
+                zones.append((zone_start, i))
+            in_zone = False
+    
+    if in_zone and len(coords) - zone_start >= min_zone_length:
+        zones.append((zone_start, len(coords)))
+    
+    return zones
+
+
+def separate_z_levels(
+    points_xyz: List[Tuple[float, float, float]],
+    z_separation_threshold_m: float = 3.0,
+) -> List[List[int]]:
+    """
+    Separate points into groups by Z-level (altitude).
+    
+    Used to prevent conflating bridge traffic with underpass traffic
+    at interchange locations.
+    
+    Args:
+        points_xyz: List of (x, y, z) coordinates where z is altitude
+        z_separation_threshold_m: Minimum Z difference to consider separate levels
+        
+    Returns:
+        List of index groups, where each group contains points at same Z-level
+    """
+    if not points_xyz:
+        return []
+    
+    # Extract Z values, handling None/nan
+    z_vals = []
+    valid_indices = []
+    for i, (x, y, z) in enumerate(points_xyz):
+        if z is not None and not math.isnan(z):
+            z_vals.append(z)
+            valid_indices.append(i)
+    
+    if len(z_vals) < 2:
+        return [list(range(len(points_xyz)))]  # All in one group
+    
+    # Cluster by Z-level using simple hierarchical approach
+    z_arr = np.array(z_vals)
+    sorted_idx = np.argsort(z_arr)
+    sorted_z = z_arr[sorted_idx]
+    
+    # Find breaks in Z values
+    groups = []
+    current_group = [valid_indices[sorted_idx[0]]]
+    prev_z = sorted_z[0]
+    
+    for i in range(1, len(sorted_z)):
+        if sorted_z[i] - prev_z > z_separation_threshold_m:
+            # Start new group
+            groups.append(current_group)
+            current_group = []
+        current_group.append(valid_indices[sorted_idx[i]])
+        prev_z = sorted_z[i]
+    
+    if current_group:
+        groups.append(current_group)
+    
+    # Add points without Z values to the largest group
+    points_with_z = set(valid_indices)
+    points_without_z = [i for i in range(len(points_xyz)) if i not in points_with_z]
+    
+    if points_without_z and groups:
+        largest_group = max(groups, key=len)
+        largest_group.extend(points_without_z)
+    elif points_without_z:
+        groups.append(points_without_z)
+    
+    return groups
