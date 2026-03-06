@@ -71,8 +71,8 @@ def evaluate_phase(phase_name, output_path, nav_gdf, buffer_m=15.0):
 
 def main():
     parser = argparse.ArgumentParser(description="HSGA Deep-Flow Pipeline Runner")
-    parser.add_argument("--sample", type=int, default=20000,
-                        help="VPD sample size (default: 20000)")
+    parser.add_argument("--sample", type=int,
+                        help="VPD sample size")
     parser.add_argument("--skip-phase1", action="store_true",
                         help="Skip Phase 1 if outputs exist")
                         
