@@ -1,0 +1,34 @@
+======================================================================
+  PHASE 3 DIAGNOSTIC SUMMARY REPORT
+======================================================================
+
+ROOT CAUSE ANALYSIS
+----------------------------------------
+
+1. MASSIVE OVERGENERATION: The network is 5.0x the GT length. Probe trajectories (5902 km) are being kept as full multi-road traces instead of being collapsed to individual road segments. This alone explains both low recall (probe data dilutes the signal) and visually incorrect output.
+
+2. LOW RECALL ON MINOR ROADS: func_class(es) [np.int64(5)] have < 60% recall. These are mostly local/residential roads (func_class 4-5) where probe coverage exists but the gap-filling overlap filter (>80% exclusion) is too aggressive.
+
+3. PARALLEL DUPLICATION: Average 15.0x duplication factor. Multiple probe trajectories follow the same road but are not merged. DBSCAN eps=30m with hemispherical heading bins is too simplistic for long, overlapping trajectories.
+
+
+RECOMMENDED FIXES
+----------------------------------------
+
+1. SPLIT PROBE TRAJECTORIES: Before gap-filling, split each probe trace at
+   intersections with existing skeleton roads. This converts km-long trajectories
+   into individual road-link-sized segments.
+
+2. REDUCE EXCLUSION THRESHOLD: Change the overlap filter from <20% to <50%
+   to keep probe segments that partially overlap the skeleton (these often
+   represent parallel or connecting roads).
+
+3. MAP-MATCH PROBES TO GT: Use proximity-based map-matching to associate probe
+   segments with GT road links, enabling per-link coverage analysis.
+
+4. IMPROVE CLUSTERING: Replace hemispherical heading bins with +/-30 degree
+   angular tolerance. Use projection onto a reference line instead of midpoint
+   DBSCAN.
+
+5. POST-FILTER BY LENGTH: Remove generated segments shorter than 20m (noise)
+   and longer than 2km (uncollapsed trajectories).

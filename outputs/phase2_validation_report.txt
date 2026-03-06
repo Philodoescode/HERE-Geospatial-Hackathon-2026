@@ -1,0 +1,23 @@
+Phase 2 -- Data Validation Report
+---------------------------------
+
+Run completed at: 2026-02-10 16:12:24
+Execution time: 670.4 s
+
+Dataset sizes:
+  VPD :   54,542 rows,  13 columns
+  HPD :    5,517 traces,   9 columns
+  Nav :    1,250 links,  14 columns
+
+Validation Checks:
+
+  #    Check                     Status   Details
+  ---  ------------------------- ------   ----------------------------------------
+  1    CRS Consistency           PASS     All GeoDataFrames have CRS = EPSG:4326.
+  2    Bounding Box              PASS     All geometries within bbox (+0.01 deg buffer).
+  3    Fused Filter              PASS     All 54542 VPD rows have fused == 'Yes'.
+  4    Geometry Validity         WARN     Issues found: HPD: 253 invalid (self-intersecting)
+  5    HPD Trace Integrity       PASS     All 5517 HPD traces have >= 2 points.
+  6    Missing Values            PASS     No nulls in critical columns across all datasets.
+
+Summary: 5 PASS, 1 WARN, 0 FAIL

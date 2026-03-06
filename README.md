@@ -1,23 +1,110 @@
-# HERE-Geospatial-Hackathon
+# HERE Geospatial Hackathon — Road Centerline Extraction
 
-Welcome to the repository for the **Feature Extraction Using GIS Data** hackathon project. This project leverages **LiDAR point clouds**, **Satellite Imagery**, and **Deep Learning** to extract semantic features (buildings, roads, vegetation) from raw geospatial data.
+> **3rd Place** at the HERE Geospatial Hackathon  
+> **Precision: 99.8% | Recall: ~71.3%**
 
-## Prerequisites
-
-- **Windows 10 / 11**
-- Administrator access (required only for Miniconda installation)
-- Internet connection
+This repository contains our solution for automatically extracting road centerlines from GPS probe data (VPD/HPD) over Kosovo. The pipeline reconstructs a clean, topologically correct road network and evaluates it against HERE Nav Streets ground truth.
 
 ---
 
-## Step 1: Install Miniconda (Automated)
+## Results
 
-Open **PowerShell as Administrator** and run the following commands.
-This will:
+| Metric | Score |
+|---|---|
+| Precision | **99.8%** |
+| Recall | **~71.3%** |
+| Final Placement | **3rd Place** |
 
-- Download Miniconda
-- Install it silently for the current user
-- Remove the installer afterward
+Evaluation is done using segmented precision/recall: both generated and reference lines are split into ~20 m chunks, and a match is counted when a chunk falls within a 15 m buffer of the opposing network.
+
+---
+
+## Problem Statement
+
+Given raw GPS traces (VPD — Vehicle Path Data, HPD — Historical Probe Data) collected over Kosovo, reconstruct the underlying road network as a set of clean LineString geometries, assessed against the HERE Nav Streets reference map.
+
+---
+
+## Pipeline Overview
+
+The solution runs as a **4-phase pipeline** (`run_pipeline.py`):
+
+### Phase 1 — Data Ingestion & Normalization
+- Bbox-clipped loading of VPD and HPD CSV files
+- Speed filtering to remove pedestrian/cycling traces
+- Per-segment heading computation (length-weighted, 8-compass-octant bins)
+- Local metric projection (EPSG:32634) for all geometric operations
+- Altitude data preserved for downstream Z-level handling
+
+### Phase 2 — Centerline Generation (Kharita-style Clustering)
+- Heading-aware incremental clustering of probe sample points
+- Directed co-occurrence graph built from trace transitions
+- Three-pass edge pruning (support, direction-conflict, transitive)
+- Roundabout detection and preservation
+- Intersection detection and line splitting
+- Segment averaging + turn-preserving smoothing
+- Dynamic weighting based on trace quality and sensor confidence
+
+### Phase 3 — Geometry Refinement & Topology Cleanup
+- Parallel segment consolidation (Hausdorff-based, conservative thresholds)
+- Z-level crossing resolution (splits overlapping grade-separated segments)
+- Sharp-angle vertex removal (bird-nesting fix)
+- B-spline smoothing with Hausdorff deviation guard
+- GPS jitter spike removal (starburst noise)
+- Dead-end stub pruning (iterative, NetworkX-based)
+
+### Phase 4 — Final Optimization & Export
+- Complex interchange / cloverleaf zone cleanup
+- Optional quality-based candidate selection
+- Final geometry cleaning and export to GeoPackage (EPSG:4326 + local CRS)
+
+---
+
+## Repository Structure
+
+```
+├── run_pipeline.py          # Main pipeline runner (all 4 phases)
+├── main.py                  # Standalone data loader + validation entry point
+├── src/
+│   ├── config.py            # Paths, CRS, bounding box constants
+│   ├── pipeline_phase1.py   # Data ingestion & normalization
+│   ├── pipeline_phase2.py   # Centerline generation
+│   ├── pipeline_phase3.py   # Geometry refinement & topology
+│   ├── pipeline_phase4.py   # Final optimization & export
+│   ├── algorithms/          # Core algorithm modules
+│   │   ├── centerline_utils.py
+│   │   ├── curve_smoothing.py
+│   │   ├── dynamic_weighting.py
+│   │   ├── intersection_detection.py
+│   │   ├── roundabout_detection.py
+│   │   ├── segment_averaging.py
+│   │   ├── topology_builder.py
+│   │   └── trajectory_clustering.py
+│   ├── evaluation/
+│   │   └── metrics.py       # Segmented precision/recall evaluation
+│   ├── loaders/             # VPD, HPD, Nav Streets data loaders
+│   └── preprocessing/       # Data cleaning & validation
+├── data/
+│   ├── Kosovo_VPD/          # Vehicle Path Data (GPS traces)
+│   ├── Kosovo_HPD/          # Historical Probe Data (weeks 1 & 2)
+│   ├── Kosovo_nav_streets/  # HERE Nav Streets ground truth
+│   └── nav_streets_attributes_explained.md
+├── notebooks/               # Exploratory analysis & prototyping
+└── outputs/                 # Pipeline outputs (GeoPackage files)
+```
+
+---
+
+## Setup
+
+### Prerequisites
+
+- **Windows 10 / 11**
+- Miniconda or Anaconda
+
+### 1. Install Miniconda
+
+Open **PowerShell as Administrator**:
 
 ```powershell
 curl https://repo.anaconda.com/miniconda/Miniconda3-latest-Windows-x86_64.exe -o .\miniconda.exe
@@ -25,189 +112,78 @@ start /wait "" .\miniconda.exe /S
 del .\miniconda.exe
 ```
 
-> **Important**  
-> After installation completes, close PowerShell and open **Anaconda Prompt**.
-> The `conda` command will not be available in a normal PowerShell session yet.
+> After installation, close PowerShell and open **Anaconda Prompt**.
 
----
-
-## Step 2: Configure Global Conda Channels
-
-To ensure packages are installed from trusted sources, configure `conda-forge` as the primary channel.
-
-Run the following inside **Anaconda Prompt**:
+### 2. Configure Conda Channels
 
 ```powershell
 conda config --add channels conda-forge
 conda config --set channel_priority strict
 ```
 
-This guarantees:
-
-- Consistent builds
-- Fewer dependency conflicts
-- Faster environment resolution
-
----
-
-## Step 3: Create the Environment
-
-### 1. Create the environment from the provided file
+### 3. Create and Activate the Environment
 
 ```powershell
 conda env create -f environment.yml
-```
-
-### 2. Activate the environment
-
-```powershell
 conda activate here-env
 ```
 
 ---
 
-## Verification
-
-To ensure your environment is ready, run:
+## Running the Pipeline
 
 ```powershell
-python scripts/preprocess_traces.py --help
+python run_pipeline.py
 ```
+
+Optional flags:
+
+```powershell
+# Limit VPD sample size (faster dev runs)
+python run_pipeline.py --sample 5000
+
+# Skip Phase 1 if interim outputs already exist
+python run_pipeline.py --skip-phase1
+
+# Tune clustering radius
+python run_pipeline.py --cluster-radius-m 15.0
+```
+
+The pipeline outputs GeoPackage files to `data/` and prints precision/recall metrics after each phase.
 
 ---
 
-## Environment Summary
+## Data
 
-After setup, the environment includes:
+| Dataset | Description |
+|---|---|
+| **VPD** (Vehicle Path Data) | ~4 GB CSV of GPS traces with path geometry, speed, altitude, quality scores |
+| **HPD** (Historical Probe Data) | Two weeks of probe traces over Kosovo |
+| **Nav Streets** | HERE reference road network used as ground truth for evaluation |
 
-- **Python 3.10**
-- **GDAL & PDAL** - Geospatial data processing
-- **GeoPandas & Shapely** - Vector data manipulation
-- **Rasterio & PyProj** - Raster & projection tools
-- **LASpy & LAZrs** - LAS/LAZ point cloud support
-- **Open3D** - 3D point cloud visualization
-- **PyTorch & TorchVision** - Deep learning
-- **JupyterLab** - Interactive notebooks
-- **Scikit-learn & Matplotlib** - ML & visualization
+All data is scoped to a 10 × 10 km bounding box over Kosovo (`EPSG:4326`).
+
+---
+
+## Key Dependencies
+
+- **GeoPandas & Shapely** — Vector geometry operations
+- **PyProj** — CRS transformations (EPSG:4326 ↔ EPSG:32634)
+- **SciPy** — Spatial indexing (`cKDTree`), B-spline smoothing
+- **NetworkX** — Topology graph analysis & stub pruning
+- **NumPy / Pandas** — Data processing
+- **JupyterLab** — Exploratory notebooks
 
 ---
 
 ## Troubleshooting
 
 **"Conda is stuck solving the environment..."**
+- Press `Ctrl+C`, run `conda clean --all`, then retry.
 
-- Cancel the process (`Ctrl+C`)
-- Run `conda clean --all` and try again
+**"DLL Load Failed" on Windows**
+- Conflict between Conda and Pip versions of `shapely`/`fiona`.
+- Fix: `pip uninstall shapely fiona` then `conda install -c conda-forge shapely fiona`
 
-**"DLL Load Failed" on Windows?**
-
-- This usually means a conflict between Conda and Pip versions of `shapely` or `fiona`
-- Fix: `pip uninstall shapely fiona` -> `conda install -c conda-forge shapely fiona`
-
-**Environment creation fails?**
-
-- Ensure you have a stable internet connection
-- Try running `conda clean --all -y` first
-- Make sure conda-forge channel is configured (Step 2)
-
----
-
-## Centerline Generation (Problem 1)
-
-The repository includes two pluggable map-construction algorithms:
-
-- `kharita` (baseline)
-- `roadster` (Roadster-adapted subtrajectory clustering pipeline)
-
-### Core scripts
-
-- `scripts/preprocess_traces.py` (Probe/VPD preprocessing)
-- `scripts/prepare_navstreet_ground_truth.py` (Kosovo navstreet preprocessing)
-- `scripts/generate_centerlines.py` (map construction)
-- `scripts/evaluate_centerlines.py` (metrics + optional plots)
-
-### 1. Preprocess Probe/VPD traces
-
-```powershell
-python scripts/preprocess_traces.py `
-  --vpd-csv data/Kosovo_VPD/Kosovo_VPD.csv `
-  --hpd-csvs data/Kosovo_HPD/XKO_HPD_week_1.csv data/Kosovo_HPD/XKO_HPD_week_2.csv `
-  --out-dir outputs/preprocessed `
-  --stem kosovo_preprocessed
-```
-
-### 2. Prepare Kosovo navstreet ground truth
-
-```powershell
-python scripts/prepare_navstreet_ground_truth.py `
-  --nav-csv "data/Kosovo's nav streets/Kosovo.csv" `
-  --out-dir outputs/ground_truth `
-  --stem kosovo_navstreet_ground_truth
-```
-
-### 3. Generate centerlines (Roadster)
-
-```powershell
-python scripts/generate_centerlines.py `
-  --algorithm roadster `
-  --vpd-csv data/Kosovo_VPD/Kosovo_VPD.csv `
-  --hpd-csvs data/Kosovo_HPD/XKO_HPD_week_1.csv data/Kosovo_HPD/XKO_HPD_week_2.csv `
-  --out-dir outputs/centerlines_roadster `
-  --stem kosovo_centerlines_roadster
-```
-
-### 4. Evaluate against navstreets (+ plots)
-
-```powershell
-python scripts/evaluate_centerlines.py `
-  --generated outputs/centerlines_roadster/kosovo_centerlines_roadster.gpkg `
-  --generated-layer centerlines `
-  --ground-truth outputs/ground_truth/kosovo_navstreet_ground_truth.gpkg `
-  --ground-truth-layer navstreet `
-  --out outputs/evaluation/roadster_metrics.json `
-  --compute-topology-metrics `
-  --compute-itopo `
-  --topology-radii-m 8,15 `
-  --compute-hausdorff `
-  --return-timing `
-  --plots-out-dir outputs/evaluation/plots `
-  --plot-stem roadster_eval
-```
-
-### Notes
-
-- Roadster adaptation details: `context/roadster_adaptation_notes.md`
-- Preprocessing uses source-specific settings (tighter for VPD, more conservative for Probe/HPD).
-
----
-
-### Kharita Recall Tuning (Problem 1)
-
-Use the recall-oriented tuner with full-bbox/no-GT-clipping evaluation and
-precision/size guardrails:
-
-```powershell
-python scripts/tune_kharita_recall.py `
-  --search random `
-  --trials 24 `
-  --apply-bbox `
-  --no-clip-generated-to-ground-truth `
-  --precision-floor 0.90 `
-  --max-length-ratio 2.0 `
-  --out-dir outputs/tuning_kharita_recall
-```
-
-This writes:
-
-- `outputs/tuning_kharita_recall/tuning_results.csv`
-- `outputs/tuning_kharita_recall/tuning_best.json`
-- `outputs/tuning_kharita_recall/comparison_metrics.csv` (baseline raw vs selected vs selected+turn-smoothing)
-
-### Roadster Tuning Helper
-
-```powershell
-python scripts/tune_roadster_params.py `
-  --search random `
-  --trials 24 `
-  --out-dir outputs/tuning_roadster
-```
+**Pipeline runs out of memory on VPD loading**
+- Use `--sample 3000` to reduce the VPD sample size.
